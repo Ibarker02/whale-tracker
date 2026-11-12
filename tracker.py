@@ -1,0 +1,851 @@
+#!/usr/bin/env python3
+"""
+Polymarket Whale Tracker
+========================
+Checks a list of Polymarket wallets for new trades since the last run and
+posts them to Discord as clean, easy-to-read alerts.
+
+What it does
+  * Combines split fills: one order filled in 5 pieces = ONE alert.
+  * Units: sizes every play against that wallet's typical (median) bet,
+    so a $500 play from a $100 bettor shows as 5.0u.
+  * Grades the wallet's past plays by size (<1u, 1-3u, 3-5u, 5u+) and
+    flags new plays in its proven buckets:
+        🟢 GREEN LIGHT - this size has made money for this wallet
+        🔴 FADE        - this size has lost money for this wallet
+  * Posts a weekly report card for each wallet (record + ROI by size).
+
+  * Data source : Polymarket's free public Data API v2 (no API key needed)
+  * Dependencies: none - Python 3.8+ standard library only
+  * State       : state.json remembers what was posted + each wallet's stats
+
+The SAME script is used for both setups:
+  * Local          -> python tracker.py   (reads wallets.txt + SETTINGS below)
+  * GitHub Actions -> reads the WALLETS and DISCORD_WEBHOOK_URL secrets
+
+Any setting below can be overridden with an environment variable of the
+same name, which is how the GitHub Actions version gets its secrets.
+"""
+
+import hashlib
+import json
+import os
+import statistics
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from datetime import datetime, timezone
+
+# ---------------------------------------------------------------------------
+# SETTINGS  (edit these for local use; GitHub Actions overrides them)
+# ---------------------------------------------------------------------------
+
+# Local use: paste your Discord webhook URL between the quotes.
+# GitHub Actions: LEAVE THIS BLANK and use the DISCORD_WEBHOOK_URL secret.
+DISCORD_WEBHOOK_URL = ""
+
+# Plays smaller than this many USDC are ignored, unless the wallet has its
+# own minimum in the wallet list. Split fills are added up first, so a
+# $600 order filled as 3 x $200 counts as $600.
+DEFAULT_MIN_TRADE_USD = 100
+
+# When a wallet is seen for the first time, how far back to look for trades
+# to post. 0 = only trades made after the wallet was added.
+FIRST_RUN_LOOKBACK_HOURS = 0
+
+# --- Units & grading ---
+HISTORY_DAYS = 180           # how far back to look when grading past plays
+MIN_SAMPLE = 15              # graded plays needed before a size can earn
+                             # a 🟢 or 🔴 (fewer = could just be luck)
+GREEN_LIGHT_MIN_ROI = 10     # bucket ROI (%) at or above this -> 🟢 GREEN LIGHT
+FADE_MAX_ROI = -10           # bucket ROI (%) at or below this -> 🔴 FADE
+PROFILE_REFRESH_DAYS = 7     # re-grade each wallet (and post its report) weekly
+WEEKLY_REPORT = 1            # 1 = post the weekly report card, 0 = don't
+
+# Which plays get posted to Discord (applies to every wallet):
+#   "green" - only 🟢 GREEN LIGHT plays: sizes where that wallet is proven
+#             to win. Average plays, fades and sells are skipped.
+#   "signals" - 🟢 GREEN LIGHT and 🔴 FADE plays
+#   "all"   - every play above the wallet's minimum
+ALERTS = "green"
+
+# Safety cap so one hyperactive wallet can't flood the channel. If a wallet
+# has more plays than this in one run, only the largest are posted, plus a
+# one-line note saying how many were left out.
+MAX_ALERTS_PER_WALLET = 25
+
+# Files (kept next to this script).
+BASE_DIR = Path(__file__).resolve().parent
+WALLETS_FILE = BASE_DIR / "wallets.txt"
+STATE_FILE = BASE_DIR / "state.json"
+
+# ---------------------------------------------------------------------------
+# Things you normally don't need to touch
+# ---------------------------------------------------------------------------
+
+API_BASE = "https://data-api.polymarket.com"
+PAGE_SIZE = 500              # rows per request (the API allows up to 1000)
+MAX_PAGES = 40               # per wallet per run
+MAX_HISTORY_POSITIONS = 5000 # cap per status on past positions read when grading
+MIN_HISTORY_DAYS = 14        # very active wallets: shrink the grading window
+                             # (down to this) until it fits under the cap
+POSITIONS_PAGE = 1000        # the positions endpoint allows 1000 per page
+OVERLAP_SECONDS = 300        # re-check the last 5 minutes each run in case the
+                             # API indexed a trade late; duplicates are filtered
+GRADER_VERSION = 2           # bumped when grading changes -> everyone re-grades
+USER_AGENT = "polymarket-whale-tracker/2.1"   # Discord rejects Python's default
+
+# Size buckets used for grading: (from units, up to units, label)
+BUCKETS = [(0, 1, "<1u"), (1, 3, "1-3u"), (3, 5, "3-5u"), (5, float("inf"), "5u+")]
+
+# Embed colours
+GREEN, RED = 0x2ECC71, 0xE74C3C
+GREY, BLUE, GOLD, ORANGE = 0x95A5A6, 0x3498DB, 0xF1C40F, 0xE67E22
+PURPLE = 0x9B59B6
+
+
+# ---------------------------------------------------------------------------
+# Settings & wallet list
+# ---------------------------------------------------------------------------
+
+def setting(name, default, cast=str):
+    """Return the environment variable `name` if set, otherwise `default`."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return cast(raw)
+    except ValueError:
+        sys.exit(f"ERROR: setting {name}={raw!r} is not a valid {cast.__name__}")
+
+
+def to_number(text):
+    return float(text.replace("$", "").replace(",", "").strip())
+
+
+def parse_wallets(text, default_min):
+    """
+    Parse the wallet list. One wallet per line, extras separated by commas:
+
+        0xADDRESS
+        0xADDRESS, 500                      <- minimum play size $500
+        0xADDRESS, 500, BigFish             <- + nickname
+        0xADDRESS, BigFish, unit=250        <- + fixed unit size of $250
+        0xADDRESS, min=1000, unit=500, name=Sharp Guy
+
+    A bare number is the minimum. `unit=` overrides the calculated unit.
+    Anything after a # is a comment. Returns a list of dicts.
+    """
+    wallets, seen = [], set()
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",") if p.strip()]
+        address = parts[0].lower()
+
+        # Basic sanity check: 0x followed by 40 hex characters.
+        is_hex = all(c in "0123456789abcdef" for c in address[2:])
+        if not (address.startswith("0x") and len(address) == 42 and is_hex):
+            print(f"WARNING: wallet list line {line_no} is not a valid "
+                  f"0x address - skipped")
+            continue
+        if address in seen:
+            continue
+        seen.add(address)
+
+        wallet = {"address": address, "min_usd": default_min,
+                  "label": "", "unit_override": None}
+        for part in parts[1:]:
+            try:
+                if "=" in part:
+                    key, value = (x.strip() for x in part.split("=", 1))
+                    key = key.lower()
+                    if key == "min":
+                        wallet["min_usd"] = to_number(value)
+                    elif key == "unit":
+                        wallet["unit_override"] = to_number(value)
+                    elif key in ("name", "label"):
+                        wallet["label"] = value
+                    else:
+                        print(f"WARNING: line {line_no}: unknown option {key!r}")
+                else:
+                    wallet["min_usd"] = to_number(part)
+            except ValueError:
+                if "=" in part:
+                    print(f"WARNING: line {line_no}: {part!r} is not a number")
+                else:
+                    wallet["label"] = part
+        wallets.append(wallet)
+    return wallets
+
+
+def load_wallets(default_min):
+    """Wallets come from the WALLETS env var (GitHub) or wallets.txt (local)."""
+    text = os.environ.get("WALLETS", "").strip()
+    if not text and WALLETS_FILE.exists():
+        text = WALLETS_FILE.read_text(encoding="utf-8")
+    return parse_wallets(text, default_min)
+
+
+# ---------------------------------------------------------------------------
+# State (what we've already posted + each wallet's stats)
+# ---------------------------------------------------------------------------
+
+def load_state():
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            print("WARNING: state.json is unreadable - starting fresh")
+    return {}
+
+
+def save_state(state):
+    """Write to a temp file first so a crash can't leave a half-written file."""
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(STATE_FILE)
+
+
+def state_key(address):
+    """
+    Wallets are stored in state.json under a hash rather than the address
+    itself, so the file doesn't reveal who you're tracking.
+    """
+    return hashlib.sha256(address.encode()).hexdigest()[:16]
+
+
+def trade_id(trade):
+    """A fingerprint that identifies one fill, used to avoid re-posting."""
+    return "|".join(str(trade.get(k, "")) for k in
+                    ("transactionHash", "asset", "side", "size", "price"))
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+
+def http_json(url, payload=None, retries=4):
+    """
+    GET (or POST when `payload` is given) and return the decoded JSON reply,
+    or None for an empty reply. Retries on rate limits (429) and temporary
+    server/network errors, then raises RuntimeError.
+    """
+    data = json.dumps(payload).encode() if payload is not None else None
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    if data:
+        headers["Content-Type"] = "application/json"
+
+    error = "unknown error"
+    for attempt in range(retries):
+        request = urllib.request.Request(url, data=data, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                body = response.read().decode("utf-8")
+                return json.loads(body) if body.strip() else None
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")
+            error = f"HTTP {exc.code}: {body[:200]}"
+            if exc.code == 429:
+                wait = retry_after_seconds(exc, body)
+            elif exc.code >= 500:
+                wait = 2 ** attempt
+            else:
+                break                      # 4xx = our mistake, retry won't help
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            error = f"network error: {exc}"
+            wait = 2 ** attempt
+        time.sleep(min(wait, 60))
+    raise RuntimeError(error)
+
+
+def retry_after_seconds(exc, body):
+    """Work out how long a 429 reply is asking us to wait."""
+    try:
+        return float(json.loads(body)["retry_after"]) + 0.25   # Discord style
+    except (ValueError, KeyError, TypeError):
+        pass
+    try:
+        return float(exc.headers.get("Retry-After", 5))        # header style
+    except (TypeError, ValueError):
+        return 5.0
+
+
+def fetch_pages(path, params, max_rows):
+    """
+    Read a paged v2 endpoint. Replies look like
+        {"data": [...], "pagination": {"next_cursor": "..." or null}}
+    and we keep following next_cursor until it's empty or max_rows is hit.
+    Returns (rows, more) - `more` is True if rows were left unread.
+    """
+    rows, cursor = [], None
+    for _ in range(MAX_PAGES):
+        query = dict(params)
+        if cursor:
+            query["cursor"] = cursor
+        reply = http_json(f"{API_BASE}{path}?{urllib.parse.urlencode(query)}")
+        if isinstance(reply, dict):
+            page = reply.get("data") or []
+            cursor = (reply.get("pagination") or {}).get("next_cursor")
+        else:                                   # just in case: a bare list
+            page, cursor = reply or [], None
+        rows.extend(page)
+        if not cursor or not page or len(rows) >= max_rows:
+            break
+    more = bool(cursor and page) or len(rows) > max_rows
+    return rows[:max_rows], more
+
+
+# ---------------------------------------------------------------------------
+# Polymarket: trades
+# ---------------------------------------------------------------------------
+
+def num(value, default=0.0):
+    """Turn an API value into a float (None / junk -> default)."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def to_int(value):
+    """Timestamp as whole epoch seconds (tolerates millisecond values)."""
+    number = int(num(value))
+    return number // 1000 if number > 10**11 else number
+
+
+def normalize(row):
+    """
+    Data API v2 names its fields in snake_case (usdc_size, event_slug...).
+    Copy the ones we use into the names the rest of this script expects.
+    """
+    return {
+        "type": row.get("type", "TRADE"),
+        "timestamp": row.get("timestamp"),
+        "side": str(row.get("side", "")).upper(),
+        "outcome": row.get("outcome"),
+        "size": row.get("size"),
+        "price": row.get("price"),
+        "title": row.get("title"),
+        "slug": row.get("slug"),
+        "icon": row.get("icon"),
+        "usdcSize": row.get("usdc_size", row.get("usdcSize")),
+        "eventSlug": row.get("event_slug", row.get("eventSlug")),
+        "transactionHash": row.get("transaction_hash", row.get("transactionHash")),
+        "asset": row.get("token_id", row.get("asset")),
+    }
+
+
+def fetch_trades_since(address, since_ts):
+    """Return the wallet's fills with timestamp >= since_ts, oldest first."""
+    rows, _ = fetch_pages("/v2/activity", {
+        "user": address,
+        "type": "TRADE",
+        "start": int(since_ts),
+        "limit": PAGE_SIZE,
+        "sort_direction": "ASC",
+    }, max_rows=PAGE_SIZE * MAX_PAGES)
+
+    trades, ids = [], set()
+    for row in rows:
+        trade = normalize(row)
+        if trade["type"] != "TRADE":
+            continue
+        tid = trade_id(trade)
+        if tid not in ids:
+            ids.add(tid)
+            trades.append(trade)
+    trades.sort(key=lambda t: to_int(t.get("timestamp")))
+    return trades
+
+
+def usdc_value(trade):
+    """Fill size in USDC. Falls back to shares x price if not supplied."""
+    value = num(trade.get("usdcSize"))
+    if value <= 0:
+        value = num(trade.get("size")) * num(trade.get("price"))
+    return value
+
+
+def combine_fills(trades):
+    """
+    Merge fills of the same outcome token + side into one "play".
+    A $600 buy filled as three $200 pieces becomes one $600 play with an
+    average price, the latest time, and the list of fills it came from.
+    """
+    plays = {}
+    for t in trades:
+        key = (t.get("asset") or t.get("title"), t.get("outcome"), t.get("side"))
+        play = plays.get(key)
+        if play is None:
+            play = plays[key] = dict(t, usd=0.0, shares=0.0, fills=[])
+        play["usd"] += usdc_value(t)
+        play["shares"] += num(t.get("size"))
+        play["fills"].append(t)
+        play["timestamp"] = max(to_int(play["timestamp"]), to_int(t.get("timestamp")))
+    for play in plays.values():
+        if play["shares"] > 0:
+            play["price"] = play["usd"] / play["shares"]
+    return sorted(plays.values(), key=lambda p: p["timestamp"])
+
+
+# ---------------------------------------------------------------------------
+# Polymarket: grading past plays
+# ---------------------------------------------------------------------------
+
+def bucket_for(units):
+    for low, high, label in BUCKETS:
+        if low <= units < high:
+            return label
+    return BUCKETS[-1][2]
+
+
+def build_profile(wallet, history_days):
+    """
+    Work out the wallet's unit size and grade its past plays by size.
+
+    Past plays = positions that are finished:
+      * CLOSED     - the wallet sold out or redeemed
+      * REDEEMABLE - the market resolved but tokens are still held. This
+                     matters: whales often never bother redeeming LOSERS, so
+                     reading CLOSED alone would hide most of the losses.
+    Each position is one graded play:
+      stake = shares bought x average entry price
+      P&L   = total_pnl (realized + whatever the leftover tokens are worth)
+    """
+    address = wallet["address"]
+
+    # Very active wallets have thousands of positions. Both lists must cover
+    # the SAME time window, or wins and losses get counted over different
+    # periods (and the record comes out badly wrong). So: ask the API for
+    # the window, and if either list is too long to read in full, halve the
+    # window and try again.
+    days = history_days
+    while True:
+        since = int(time.time() - days * 86400)
+        rows, capped, oldest_closed = [], False, None
+        for status in ("CLOSED", "REDEEMABLE"):
+            got, more = fetch_pages("/v2/positions", {
+                "user": address,
+                "status": status,
+                "start": since,             # filters on last activity time
+                "sort_by": "TIMESTAMP",
+                "sort_direction": "DESC",
+                "limit": POSITIONS_PAGE,
+            }, max_rows=MAX_HISTORY_POSITIONS)
+            capped = capped or more
+            if status == "CLOSED" and more and got:
+                oldest_closed = min(to_int(p.get("last_event_at")) for p in got)
+            rows += got
+        if not capped or days <= MIN_HISTORY_DAYS:
+            break
+        days = max(MIN_HISTORY_DAYS, days // 2)
+
+    # Still too many even at the smallest window: only use the stretch of
+    # time the (newest-first) CLOSED list actually reached.
+    if oldest_closed:
+        since = max(since, oldest_closed)
+
+    plays, seen_tokens = [], set()
+    for p in rows:
+        token = p.get("token_id") or p.get("asset")
+        if token in seen_tokens:
+            continue
+        seen_tokens.add(token)
+        when = to_int(p.get("last_event_at")) or to_int(p.get("first_entry_at"))
+        if when and when < since:
+            continue                        # outside the grading window
+        stake = num(p.get("total_size")) * num(p.get("avg_price"))
+        if stake <= 0:
+            stake = num(p.get("total_cost_usdc")) or num(p.get("entry_cost_usdc"))
+        if stake < 1:
+            continue                        # dust
+        if p.get("total_pnl") is not None:
+            pnl = num(p.get("total_pnl"))
+        else:
+            pnl = num(p.get("realized_pnl")) + num(p.get("unrealized_pnl"))
+        plays.append((stake, pnl))
+
+    unit = wallet["unit_override"]
+    if not unit and len(plays) >= 5:
+        unit = statistics.median(stake for stake, _ in plays)
+
+    buckets = {label: {"w": 0, "l": 0, "stake": 0.0, "pnl": 0.0}
+               for _, _, label in BUCKETS}
+    if unit:
+        for stake, pnl in plays:
+            b = buckets[bucket_for(stake / unit)]
+            b["w" if pnl > 0 else "l"] += 1
+            b["stake"] += stake
+            b["pnl"] += pnl
+
+    return {
+        "unit": round(unit, 2) if unit else None,
+        "unit_override": wallet["unit_override"],
+        "graded": len(plays),
+        "days": max(1, round((time.time() - since) / 86400)),
+        "buckets": buckets,
+        "updated": int(time.time()),
+        "version": GRADER_VERSION,
+    }
+
+
+def bucket_stats(profile, label):
+    """Return (wins, losses, roi_percent) for one bucket, or None."""
+    b = (profile or {}).get("buckets", {}).get(label)
+    if not b or not b["stake"]:
+        return None
+    return b["w"], b["l"], 100 * b["pnl"] / b["stake"]
+
+
+def size_stats(profile, units):
+    """
+    Record for plays of THIS size or bigger, e.g. a 3.2u play is judged on
+    every 3u+ play ("3u+ is 10-0"). Plays under 1u use the <1u bucket only.
+    Returns (label, (wins, losses, roi)) or (label, None).
+    """
+    label = bucket_for(units)
+    if label == BUCKETS[0][2]:
+        return label, bucket_stats(profile, label)
+    low = next(lo for lo, _, lab in BUCKETS if lab == label)
+    w = l = 0
+    stake = pnl = 0.0
+    for lo, _, lab in BUCKETS:
+        b = (profile or {}).get("buckets", {}).get(lab)
+        if lo >= low and b:
+            w, l = w + b["w"], l + b["l"]
+            stake, pnl = stake + b["stake"], pnl + b["pnl"]
+    name = f"{low:g}u+"
+    return name, ((w, l, 100 * pnl / stake) if stake else None)
+
+
+def american_odds(price):
+    """Polymarket price (0-1) -> sportsbook odds, e.g. 0.524 -> -110."""
+    if not 0 < price < 1:
+        return ""
+    if price >= 0.5:
+        return f"-{round(100 * price / (1 - price))}"
+    return f"+{round(100 * (1 - price) / price)}"
+
+
+def signal_for(stats, min_sample, green_roi, fade_roi):
+    """'green', 'fade' or None for a bucket's (wins, losses, roi)."""
+    if not stats:
+        return None
+    wins, losses, roi = stats
+    if wins + losses < min_sample:
+        return None
+    if roi >= green_roi:
+        return "green"
+    if roi <= fade_roi:
+        return "fade"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Discord
+# ---------------------------------------------------------------------------
+
+def short(address):
+    return f"{address[:6]}…{address[-4:]}"
+
+
+def size_colour(units):
+    if units is None or units < 1:
+        return GREY
+    if units < 3:
+        return BLUE
+    if units < 5:
+        return GOLD
+    return ORANGE
+
+
+def play_signal(play, profile, cfg):
+    """'green', 'fade' or None for one play (sells never get a signal)."""
+    unit = (profile or {}).get("unit")
+    if not unit or play.get("side") != "BUY":
+        return None
+    _, stats = size_stats(profile, play["usd"] / unit)
+    return signal_for(stats, cfg["min_sample"], cfg["green_roi"], cfg["fade_roi"])
+
+
+def build_alert(play, wallet, profile, cfg):
+    """
+    Turn one play into a compact Discord embed:
+
+        🟢 GREEN LIGHT · DiamondHands 3.2u play!
+        3u+ is 10-0 · +51% ROI
+        Play: Buccaneers +194  ($1,900 @ 34¢)
+        Spread: Bears (-6.5)
+        3 fills • Today at 8:14 AM
+    """
+    address = wallet["address"]
+    name = wallet["label"] or short(address)
+    side = play.get("side", "")
+    unit = (profile or {}).get("unit")
+    units = play["usd"] / unit if unit else None
+
+    # The signal only applies to buys - a sell is the wallet exiting.
+    signal, stats_line = None, ""
+    if units is not None and side == "BUY":
+        label, stats = size_stats(profile, units)
+        signal = signal_for(stats, cfg["min_sample"], cfg["green_roi"], cfg["fade_roi"])
+        if stats:
+            wins, losses, roi = stats
+            stats_line = f"**{label} is {wins}-{losses}** · {roi:+.0f}% ROI"
+            if wins + losses < cfg["min_sample"]:
+                stats_line += " (small sample)"
+
+    size_txt = f" {units:.1f}u" if units is not None else ""
+    if side == "SELL":
+        header, colour = f"↩️ {name} sold{size_txt}", PURPLE
+    elif signal == "green":
+        header, colour = f"🟢 GREEN LIGHT · {name}{size_txt} play!", GREEN
+    elif signal == "fade":
+        header, colour = f"🔴 FADE · {name}{size_txt} play", RED
+    else:
+        header, colour = f"⚪ {name}{size_txt} play", size_colour(units)
+
+    outcome = play.get("outcome") or "?"
+    price = num(play.get("price"))
+    odds = american_odds(price)
+    slug = play.get("eventSlug") or play.get("slug")
+    market_url = f"https://polymarket.com/event/{slug}" if slug else None
+    title = (play.get("title") or "Unknown market")[:200]
+
+    verb = "Sold" if side == "SELL" else "Play"
+    lines = []
+    if stats_line:
+        lines.append(stats_line)
+    lines.append(f"**{verb}: {outcome} {odds}**  (${play['usd']:,.0f} @ {price * 100:.0f}¢)")
+    lines.append(f"[{title}]({market_url})" if market_url else title)
+
+    fills = len(play["fills"])
+    embed = {
+        "title": header[:256],
+        # Clicking the header opens the market (or the wallet if no market link)
+        "url": market_url or f"https://polymarket.com/profile/{address}",
+        "description": "\n".join(lines),
+        "color": colour,
+        # Discord shows this in the footer as "Today at 8:14 AM"
+        "timestamp": datetime.fromtimestamp(play["timestamp"], tz=timezone.utc).isoformat(),
+    }
+    if fills > 1:
+        embed["footer"] = {"text": f"{fills} fills"}
+    if str(play.get("icon", "")).startswith("http"):
+        embed["thumbnail"] = {"url": play["icon"]}
+    return embed
+
+
+def build_report(wallet, profile, cfg):
+    """Weekly report card: record and ROI for each size bucket."""
+    name = wallet["label"] or short(wallet["address"])
+    unit = profile.get("unit")
+    if not unit:
+        body = (f"Not enough finished plays yet to grade "
+                f"({profile.get('graded', 0)} in the last "
+                f"{profile.get('days', cfg['history_days'])} days).")
+    else:
+        rows = ["Size   Record    ROI"]
+        for _, _, label in BUCKETS:
+            stats = bucket_stats(profile, label)
+            if not stats:
+                rows.append(f"{label:<6} -         -")
+                continue
+            wins, losses, roi = stats
+            mark = {"green": " 🟢", "fade": " 🔴"}.get(
+                signal_for(stats, cfg["min_sample"], cfg["green_roi"], cfg["fade_roi"]), "")
+            rows.append(f"{label:<6} {f'{wins}-{losses}':<9} {roi:+.0f}%{mark}")
+        how = "set by you" if profile.get("unit_override") else "median bet"
+        body = ("```\n" + "\n".join(rows) + "\n```"
+                f"1u = **${unit:,.0f}** ({how}) · {profile['graded']} graded plays, "
+                f"last {profile.get('days', cfg['history_days'])} days")
+    return {
+        "title": f"📊 Report card · {name}",
+        "url": f"https://polymarket.com/profile/{wallet['address']}",
+        "description": body,
+        "color": BLUE,
+    }
+
+
+def post_to_discord(webhook_url, embeds=None, content=None):
+    """Send one Discord message (maximum 10 embeds per message)."""
+    payload = {"username": "Whale Tracker"}
+    if embeds:
+        payload["embeds"] = embeds
+    if content:
+        payload["content"] = content
+    http_json(webhook_url, payload=payload)
+    time.sleep(0.7)                         # stay well under webhook limits
+
+
+# ---------------------------------------------------------------------------
+# Main logic
+# ---------------------------------------------------------------------------
+
+def refresh_profile_if_due(wallet, entry, cfg):
+    """
+    Re-grade the wallet if it's never been graded, the weekly refresh is due,
+    or you changed its unit= setting. Returns True if it was refreshed.
+    """
+    profile = entry.get("profile")
+    due = (not profile
+           or time.time() - profile.get("updated", 0) >= cfg["refresh_days"] * 86400
+           or profile.get("unit_override") != wallet["unit_override"]
+           or profile.get("version") != GRADER_VERSION)
+    if not due:
+        return False
+    try:
+        entry["profile"] = build_profile(wallet, cfg["history_days"])
+        return True
+    except RuntimeError as exc:
+        # Grading is a bonus - if it fails, alerts still go out (with the old
+        # stats if we have them) and grading is retried next run.
+        print(f"  {short(wallet['address'])}: grading failed - {exc}")
+        return False
+
+
+def process_wallet(wallet, state, webhook_url, cfg):
+    """
+    Check one wallet, post its new plays, update `state`.
+    Returns (number posted, report embed or None).
+    """
+    address = wallet["address"]
+    key = state_key(address)
+    now = int(time.time())
+
+    first_time = key not in state
+    if first_time:
+        state[key] = {"last_ts": now - int(cfg["lookback_hours"] * 3600), "seen": []}
+    entry = state[key]
+
+    refreshed = refresh_profile_if_due(wallet, entry, cfg)
+    report = (build_report(wallet, entry["profile"], cfg)
+              if refreshed and cfg["weekly_report"] else None)
+    profile = entry.get("profile")
+
+    if first_time and cfg["lookback_hours"] <= 0:
+        print(f"  {short(address)}: new wallet - tracking starts now")
+        return 0, report
+
+    already_seen = set(entry.get("seen", []))
+    since = max(0, int(entry["last_ts"]) - OVERLAP_SECONDS)
+    trades = fetch_trades_since(address, since)
+    new_trades = [t for t in trades if trade_id(t) not in already_seen]
+
+    # Combine split fills, then apply this wallet's minimum to the whole play.
+    plays = [p for p in combine_fills(new_trades) if p["usd"] >= wallet["min_usd"]]
+
+    # Keep only the plays worth acting on (see ALERTS setting).
+    found = len(plays)
+    if cfg["alerts"] == "green":
+        plays = [p for p in plays if play_signal(p, profile, cfg) == "green"]
+    elif cfg["alerts"] == "signals":
+        plays = [p for p in plays if play_signal(p, profile, cfg) in ("green", "fade")]
+    filtered_out = found - len(plays)
+    skipped = 0
+    if len(plays) > cfg["max_alerts"]:
+        skipped = len(plays) - cfg["max_alerts"]
+        plays = sorted(sorted(plays, key=lambda p: p["usd"], reverse=True)
+                       [:cfg["max_alerts"]], key=lambda p: p["timestamp"])
+
+    # Post in batches of 10 embeds (Discord's per-message limit).
+    posted = 0
+    try:
+        for i in range(0, len(plays), 10):
+            batch = plays[i:i + 10]
+            post_to_discord(webhook_url, embeds=[build_alert(p, wallet, profile, cfg)
+                                                 for p in batch])
+            posted += len(batch)
+            for play in batch:
+                already_seen.update(trade_id(f) for f in play["fills"])
+        if skipped:
+            name = wallet["label"] or short(address)
+            post_to_discord(webhook_url, content=(
+                f"ℹ️ **{name}** made {skipped} more play(s) above "
+                f"${wallet['min_usd']:,.0f} this period - only the largest "
+                f"{cfg['max_alerts']} are shown."))
+    except RuntimeError:
+        # Discord failed part-way. Remember only what was actually posted,
+        # and leave last_ts alone so the rest is retried on the next run.
+        entry["seen"] = sorted(already_seen)
+        raise
+
+    # Success: move the bookmark forward. Keep fingerprints only for fills
+    # inside the overlap window - that is all the next run needs.
+    if trades:
+        newest = max(to_int(t.get("timestamp")) for t in trades)
+        entry["last_ts"] = max(int(entry["last_ts"]), newest)
+        cutoff = entry["last_ts"] - OVERLAP_SECONDS
+        entry["seen"] = sorted(trade_id(t) for t in trades
+                               if to_int(t.get("timestamp")) >= cutoff)
+
+    unit = (profile or {}).get("unit")
+    unit_txt = f", 1u=${unit:,.0f}" if unit else ""
+    print(f"  {short(address)}: {len(new_trades)} new fill(s), {posted} play(s) "
+          f"posted, {filtered_out} skipped as average "
+          f"(min ${wallet['min_usd']:,.0f}{unit_txt})")
+    return posted, report
+
+
+def main():
+    webhook_url = setting("DISCORD_WEBHOOK_URL", DISCORD_WEBHOOK_URL)
+    default_min = setting("DEFAULT_MIN_TRADE_USD", DEFAULT_MIN_TRADE_USD, float)
+    cfg = {
+        "lookback_hours": setting("FIRST_RUN_LOOKBACK_HOURS", FIRST_RUN_LOOKBACK_HOURS, float),
+        "max_alerts": setting("MAX_ALERTS_PER_WALLET", MAX_ALERTS_PER_WALLET, int),
+        "history_days": setting("HISTORY_DAYS", HISTORY_DAYS, int),
+        "min_sample": setting("MIN_SAMPLE", MIN_SAMPLE, int),
+        "green_roi": setting("GREEN_LIGHT_MIN_ROI", GREEN_LIGHT_MIN_ROI, float),
+        "fade_roi": setting("FADE_MAX_ROI", FADE_MAX_ROI, float),
+        "refresh_days": setting("PROFILE_REFRESH_DAYS", PROFILE_REFRESH_DAYS, float),
+        "weekly_report": setting("WEEKLY_REPORT", WEEKLY_REPORT, int),
+        "alerts": setting("ALERTS", ALERTS).lower(),
+    }
+    if cfg["alerts"] not in ("green", "signals", "all"):
+        sys.exit("ERROR: ALERTS must be green, signals or all")
+    if not webhook_url.startswith("https://"):
+        sys.exit("ERROR: no Discord webhook. Set DISCORD_WEBHOOK_URL at the top "
+                 "of tracker.py (local) or as a GitHub secret.")
+    wallets = load_wallets(default_min)
+    if not wallets:
+        sys.exit("ERROR: no wallets. Add them to wallets.txt (local) or the "
+                 "WALLETS GitHub secret.")
+
+    state = load_state()
+    print(f"Checking {len(wallets)} wallet(s)...")
+    total_posted, failures, reports = 0, 0, []
+
+    for wallet in wallets:
+        try:
+            posted, report = process_wallet(wallet, state, webhook_url, cfg)
+            total_posted += posted
+            if report:
+                reports.append(report)
+        except RuntimeError as exc:
+            # One bad wallet shouldn't stop the others. Its bookmark is not
+            # advanced, so its trades are picked up next run.
+            failures += 1
+            print(f"  {short(wallet['address'])}: FAILED - {exc}")
+        save_state(state)                   # save progress after every wallet
+        time.sleep(0.3)                     # be polite to the API
+
+    # Report cards go out together at the end, 10 per message.
+    try:
+        for i in range(0, len(reports), 10):
+            post_to_discord(webhook_url, embeds=reports[i:i + 10])
+    except RuntimeError as exc:
+        print(f"Report cards failed to post - {exc}")
+
+    print(f"Done. {total_posted} play(s) posted, {len(reports)} report card(s), "
+          f"{failures} wallet(s) failed.")
+    if failures:
+        sys.exit(1)                         # shows the run as failed in GitHub
+
+
+if __name__ == "__main__":
+    main()
