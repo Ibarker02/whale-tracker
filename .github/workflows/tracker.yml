@@ -1,0 +1,57 @@
+name: Polymarket Whale Tracker
+
+on:
+  schedule:
+    # Every 30 minutes, at :07 and :37 past each hour (about 1,440 free
+    # minutes a month - under the 2,000 a private repo gets).
+    # (Off-the-hour minutes start more reliably than :00.)
+    - cron: "7,37 * * * *"
+  workflow_dispatch: {}   # adds a "Run workflow" button for manual runs
+
+# Needed so the job can save state.json back to the repository.
+permissions:
+  contents: write
+
+# Never let two runs overlap (they would fight over state.json).
+concurrency:
+  group: whale-tracker
+  cancel-in-progress: false
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # No "pip install" step: the script only uses the standard library.
+      - name: Run the tracker
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          WALLETS: ${{ secrets.WALLETS }}
+          # Optional: create a repository VARIABLE with this name to change
+          # the default minimum without editing code. Blank = script default.
+          DEFAULT_MIN_TRADE_USD: ${{ vars.DEFAULT_MIN_TRADE_USD }}
+        run: python tracker.py
+
+      # Save the "already posted" bookmark so the next run doesn't repeat
+      # trades. Runs even if the tracker step failed, to keep partial progress.
+      - name: Save state
+        if: always()
+        run: |
+          if [ ! -f state.json ]; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if git diff --cached --quiet; then
+            echo "State unchanged - nothing to save."
+          else
+            git commit -m "Update tracker state"
+            git push
+          fi
