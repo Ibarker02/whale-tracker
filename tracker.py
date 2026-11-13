@@ -77,6 +77,13 @@ ALERTS = "green"
 # 0 = turn off.
 BIG_PLAY_UNITS = 3
 
+# --- Alert scorecard ---
+# Every 🟢 / 🟡 alert is remembered and graded once its market settles, as if
+# you bet 1u on it at the alert price. A scorecard posts every SCORECARD_DAYS.
+SCORECARD_DAYS = 7           # 0 = never post the scorecard
+GRADE_EVERY_HOURS = 3        # how often to check whether alerted games settled
+ALERT_EXPIRE_DAYS = 30       # alerts still unsettled after this are dropped
+
 # Adds a "Bet on Novig" link to every buy alert. Paste a different address
 # here if the one you use is different; leave blank ("") to hide the link.
 NOVIG_URL = ""
@@ -790,6 +797,7 @@ def process_wallet(wallet, state, webhook_url, cfg):
             posted += len(batch)
             for play in batch:
                 already_seen.update(trade_id(f) for f in play["fills"])
+                record_alert(state, key, wallet, play, profile, cfg)
         if skipped:
             name = wallet["label"] or short(address)
             post_to_discord(webhook_url, content=(
@@ -817,6 +825,207 @@ def process_wallet(wallet, state, webhook_url, cfg):
           f"posted, {filtered_out} skipped as average "
           f"(min ${wallet['min_usd']:,.0f}{unit_txt})")
     return posted, report
+
+
+# ---------------------------------------------------------------------------
+# Alert scorecard: grade our own alerts and rate every wallet
+# ---------------------------------------------------------------------------
+
+def record_alert(state, key, wallet, play, profile, cfg):
+    """Remember a posted 🟢 / 🟡 / 🔴 alert so it can be graded later."""
+    signal = play_signal(play, profile, cfg)
+    if signal not in ("green", "big", "fade"):
+        return
+    unit = (profile or {}).get("unit")
+    alerts = state.setdefault("_alerts", [])
+    alerts.append({
+        "wallet": key,
+        "name": wallet["label"] or short(wallet["address"]),
+        "signal": signal,
+        "token": str(play.get("asset") or ""),
+        "outcome": play.get("outcome"),
+        "title": play.get("title"),
+        "price": round(num(play.get("price")), 4),
+        "units": round(play["usd"] / unit, 2) if unit else None,
+        "ts": int(play["timestamp"]),
+        "result": None,                     # "W" / "L" once settled
+        "pnl": None,                        # units won/lost on a 1u bet
+    })
+    del alerts[:-1000]                      # keep the file small
+
+
+def settle_price(position):
+    """1.0 / 0.0 once a market has settled, otherwise None."""
+    price = num(position.get("current_price"), -1)
+    if price >= 0.99:
+        return 1.0
+    if 0 <= price <= 0.01:
+        return 0.0
+    return None
+
+
+def grade_alerts(state, wallets, force=False):
+    """
+    Check unsettled alerts against the wallet's finished positions. When the
+    market has settled, grade it as a 1u bet at the alert price:
+      win  -> +(1 - price) / price units     loss -> -1 unit
+    """
+    meta = state.setdefault("_meta", {})
+    now = int(time.time())
+    if not force and now - meta.get("graded_at", 0) < GRADE_EVERY_HOURS * 3600:
+        return
+    alerts = state.get("_alerts", [])
+    pending = [a for a in alerts if a["result"] is None]
+    if not pending:
+        meta["graded_at"] = now
+        return
+
+    address_of = {state_key(w["address"]): w["address"] for w in wallets}
+    by_wallet = {}
+    for a in pending:
+        by_wallet.setdefault(a["wallet"], []).append(a)
+
+    for key, items in by_wallet.items():
+        address = address_of.get(key)
+        if not address:
+            continue                        # wallet removed - left to expire
+        since = min(a["ts"] for a in items) - 3600
+        settled = {}
+        try:
+            for status in ("CLOSED", "REDEEMABLE"):
+                rows, _ = fetch_pages("/v2/positions", {
+                    "user": address, "status": status, "start": since,
+                    "sort_by": "TIMESTAMP", "sort_direction": "DESC",
+                    "limit": POSITIONS_PAGE,
+                }, max_rows=MAX_HISTORY_POSITIONS)
+                for p in rows:
+                    price = settle_price(p)
+                    if price is not None:
+                        settled[str(p.get("token_id") or p.get("asset"))] = price
+        except RuntimeError as exc:
+            print(f"  grading {short(address)} failed - {exc}")
+            continue
+        for a in items:
+            final = settled.get(a["token"])
+            if final is None or not 0 < a["price"] < 1:
+                continue
+            if final == 1.0:
+                a["result"], a["pnl"] = "W", round((1 - a["price"]) / a["price"], 3)
+            else:
+                a["result"], a["pnl"] = "L", -1.0
+
+    # Forget alerts that never settled (market voided, wallet removed...).
+    cutoff = now - ALERT_EXPIRE_DAYS * 86400
+    state["_alerts"] = [a for a in alerts if a["result"] or a["ts"] >= cutoff]
+    meta["graded_at"] = now
+
+
+def tally(alerts):
+    """(wins, losses, roi %, units) for a list of graded alerts."""
+    graded = [a for a in alerts if a["result"]]
+    wins = sum(1 for a in graded if a["result"] == "W")
+    units = sum(a["pnl"] for a in graded)
+    roi = 100 * units / len(graded) if graded else 0.0
+    return wins, len(graded) - wins, roi, units
+
+
+def tally_line(label, alerts):
+    wins, losses, roi, units = tally(alerts)
+    if wins + losses == 0:
+        return f"{label}: no settled plays yet"
+    return f"{label}: **{wins}-{losses}** · {roi:+.0f}% ROI · **{units:+.2f}u**"
+
+
+def best_play_type(profile, cfg):
+    """
+    What to follow this wallet on, from its graded history:
+    the size with the best ROI that has a proven edge, else a winning
+    big-play size that's still a small sample. Returns (text, roi) or None.
+    """
+    if not (profile or {}).get("unit"):
+        return None
+    best = None
+    for units in (1, 3, 5):
+        label, stats = size_stats(profile, units)
+        if not stats:
+            continue
+        wins, losses, roi = stats
+        if wins + losses >= cfg["min_sample"] and roi >= cfg["green_roi"]:
+            if not best or roi > best[1]:
+                best = (f"{label} plays ({wins}-{losses}, {roi:+.0f}%)", roi)
+    if best:
+        return best
+    for units in (5, 3):
+        label, stats = size_stats(profile, units)
+        if stats and is_big_play(units, stats, cfg):
+            wins, losses, roi = stats
+            return (f"🟡 big plays {label} ({wins}-{losses}, small sample)", roi)
+    return None
+
+
+def build_scorecard(state, wallets, cfg):
+    """The weekly scorecard embed."""
+    alerts = state.get("_alerts", [])
+    week_ago = int(time.time()) - 7 * 86400
+    recent = [a for a in alerts if a["ts"] >= week_ago]
+
+    lines = ["**Last 7 days**",
+             tally_line("🟢 Green lights", [a for a in recent if a["signal"] == "green"]),
+             tally_line("🟡 Big plays", [a for a in recent if a["signal"] == "big"]),
+             "",
+             "**Since tracking began**",
+             tally_line("🟢 Green lights", [a for a in alerts if a["signal"] == "green"]),
+             tally_line("🟡 Big plays", [a for a in alerts if a["signal"] == "big"])]
+
+    # Wallet table: how each wallet's alerts have done (all-time).
+    rows = []
+    for w in wallets:
+        key = state_key(w["address"])
+        name = (w["label"] or short(w["address"]))[:15]
+        mine = [a for a in alerts if a["wallet"] == key and a["signal"] in ("green", "big")]
+        wins, losses, roi, units = tally(mine)
+        rows.append((units if wins + losses else -999, name, wins, losses, roi, units))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    table = ["Wallet          Record  ROI    Units"]
+    for _, name, wins, losses, roi, units in rows:
+        if wins + losses:
+            table.append(f"{name:<15} {f'{wins}-{losses}':<7} {roi:>+4.0f}%  {units:>+6.2f}u")
+        else:
+            table.append(f"{name:<15} -")
+    lines += ["", "**Wallets** (their 🟢/🟡 alerts)", "```", *table, "```"]
+
+    # Focus list: each wallet's strongest play type, best first.
+    focus = []
+    for w in wallets:
+        key = state_key(w["address"])
+        found = best_play_type((state.get(key) or {}).get("profile"), cfg)
+        if found:
+            focus.append((found[1], w["label"] or short(w["address"]), found[0]))
+    focus.sort(reverse=True)
+    lines.append("**🎯 Focus right now**")
+    if focus:
+        lines += [f"• **{name}** — {text}" for _, name, text in focus[:6]]
+    else:
+        lines.append("Nothing proven yet - keep tracking.")
+
+    pending = sum(1 for a in alerts if a["result"] is None)
+    return {
+        "title": "📈 Alert scorecard",
+        "description": "\n".join(lines)[:4000],
+        "color": GOLD,
+        "footer": {"text": f"Graded as a flat 1u bet per alert · {pending} alert(s) still pending"},
+    }
+
+
+def scorecard_due(state, cfg):
+    days = cfg.get("scorecard_days", SCORECARD_DAYS)
+    if not days:
+        return False
+    meta = state.setdefault("_meta", {})
+    if "scorecard_at" not in meta:          # start the clock on first run
+        meta["scorecard_at"] = int(time.time())
+        return False
+    return time.time() - meta["scorecard_at"] >= days * 86400
 
 
 def send_preview(webhook_url, cfg):
@@ -858,6 +1067,7 @@ def main():
         "alerts": setting("ALERTS", ALERTS).lower(),
         "novig_url": setting("NOVIG_URL", NOVIG_URL),
         "big_units": setting("BIG_PLAY_UNITS", BIG_PLAY_UNITS, float),
+        "scorecard_days": setting("SCORECARD_DAYS", SCORECARD_DAYS, float),
     }
     if cfg["alerts"] not in ("green", "signals", "all"):
         sys.exit("ERROR: ALERTS must be green, signals or all")
@@ -874,6 +1084,15 @@ def main():
                  "WALLETS GitHub secret.")
 
     state = load_state()
+
+    # python tracker.py --scorecard  ->  grade now and post the scorecard now
+    if "--scorecard" in sys.argv:
+        grade_alerts(state, wallets, force=True)
+        post_to_discord(webhook_url, embeds=[build_scorecard(state, wallets, cfg)])
+        save_state(state)
+        print("Scorecard posted to Discord.")
+        return
+
     print(f"Checking {len(wallets)} wallet(s)...")
     total_posted, failures, reports = 0, 0, []
 
@@ -897,6 +1116,17 @@ def main():
             post_to_discord(webhook_url, embeds=reports[i:i + 10])
     except RuntimeError as exc:
         print(f"Report cards failed to post - {exc}")
+
+    # Grade alerts whose games have settled; post the weekly scorecard.
+    grade_alerts(state, wallets)
+    if scorecard_due(state, cfg):
+        try:
+            post_to_discord(webhook_url, embeds=[build_scorecard(state, wallets, cfg)])
+            state["_meta"]["scorecard_at"] = int(time.time())
+            print("Weekly scorecard posted.")
+        except RuntimeError as exc:
+            print(f"Scorecard failed to post - {exc}")
+    save_state(state)
 
     print(f"Done. {total_posted} play(s) posted, {len(reports)} report card(s), "
           f"{failures} wallet(s) failed.")
