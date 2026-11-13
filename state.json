@@ -411,9 +411,9 @@
     {
       "name": "TrustMeBro",
       "outcome": "Azerbaijan",
-      "pnl": null,
+      "pnl": -1.0,
       "price": 0.5524,
-      "result": null,
+      "result": "L",
       "signal": "green",
       "title": "Spread: Azerbaijan (-1.5)",
       "token": "110534662065225788878040513826027785840311164164262404558193486368824326643103",
@@ -424,9 +424,9 @@
     {
       "name": "CBTM",
       "outcome": "No",
-      "pnl": null,
+      "pnl": 0.178,
       "price": 0.8487,
-      "result": null,
+      "result": "W",
       "signal": "green",
       "title": "Will Greece win on 2026-11-13?",
       "token": "26954066455343073761676593811337673106472760602953388070844860200293066866356",
@@ -436,7 +436,7 @@
     }
   ],
   "_meta": {
-    "graded_at": 1794601828,
+    "graded_at": 1794612629,
     "scorecard_at": 1794531632
   },
   "a46d79622e31ebcc": {
