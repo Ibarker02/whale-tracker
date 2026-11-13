@@ -80,7 +80,7 @@ BIG_PLAY_UNITS = 3
 # --- Alert scorecard ---
 # Every 🟢 / 🟡 alert is remembered and graded once its market settles, as if
 # you bet 1u on it at the alert price. A scorecard posts every SCORECARD_DAYS.
-SCORECARD_DAYS = 7           # 0 = never post the scorecard
+SCORECARD_DAYS = 2.3           # 0 = never post the scorecard
 GRADE_EVERY_HOURS = 3        # how often to check whether alerted games settled
 ALERT_EXPIRE_DAYS = 30       # alerts still unsettled after this are dropped
 
