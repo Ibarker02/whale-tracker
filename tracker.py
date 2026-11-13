@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 
 # Local use: paste your Discord webhook URL between the quotes.
 # GitHub Actions: LEAVE THIS BLANK and use the DISCORD_WEBHOOK_URL secret.
-DISCORD_WEBHOOK_URL = ""
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1339001578648113205/BtVwtwj1sR1D2yHjWBQzC771CZK-iXgrhc2RVH96p2TiAYyc1gxk3RcKL56NLc2mWYHs"
 
 # Plays smaller than this many USDC are ignored, unless the wallet has its
 # own minimum in the wallet list. Split fills are added up first, so a
@@ -66,11 +66,20 @@ PROFILE_REFRESH_DAYS = 7     # re-grade each wallet (and post its report) weekly
 WEEKLY_REPORT = 1            # 1 = post the weekly report card, 0 = don't
 
 # Which plays get posted to Discord (applies to every wallet):
-#   "green" - only 🟢 GREEN LIGHT plays: sizes where that wallet is proven
-#             to win. Average plays, fades and sells are skipped.
+#   "green" - only 🟢 GREEN LIGHT plays (sizes where that wallet is proven
+#             to win) and 🟡 BIG PLAYs. Average plays, fades, sells skipped.
 #   "signals" - 🟢 GREEN LIGHT and 🔴 FADE plays
 #   "all"   - every play above the wallet's minimum
 ALERTS = "green"
+
+# 🟡 BIG PLAY: also post buys this many units or bigger when the wallet is
+# winning at that size but doesn't have enough plays yet for a green light.
+# 0 = turn off.
+BIG_PLAY_UNITS = 3
+
+# Adds a "Bet on Novig" link to every buy alert. Paste a different address
+# here if the one you use is different; leave blank ("") to hide the link.
+NOVIG_URL = ""
 
 # Safety cap so one hyperactive wallet can't flood the channel. If a wallet
 # has more plays than this in one run, only the largest are posted, plus a
@@ -569,8 +578,20 @@ def play_signal(play, profile, cfg):
     unit = (profile or {}).get("unit")
     if not unit or play.get("side") != "BUY":
         return None
-    _, stats = size_stats(profile, play["usd"] / unit)
-    return signal_for(stats, cfg["min_sample"], cfg["green_roi"], cfg["fade_roi"])
+    units = play["usd"] / unit
+    _, stats = size_stats(profile, units)
+    signal = signal_for(stats, cfg["min_sample"], cfg["green_roi"], cfg["fade_roi"])
+    if signal is None and is_big_play(units, stats, cfg):
+        signal = "big"
+    return signal
+
+
+def is_big_play(units, stats, cfg):
+    """A big bet at a size the wallet wins at, but on too few plays to prove it."""
+    if not cfg.get("big_units") or units < cfg["big_units"] or not stats:
+        return False
+    wins, losses, roi = stats
+    return wins > losses and roi > 0 and wins + losses < cfg["min_sample"]
 
 
 def build_alert(play, wallet, profile, cfg):
@@ -594,6 +615,8 @@ def build_alert(play, wallet, profile, cfg):
     if units is not None and side == "BUY":
         label, stats = size_stats(profile, units)
         signal = signal_for(stats, cfg["min_sample"], cfg["green_roi"], cfg["fade_roi"])
+        if signal is None and is_big_play(units, stats, cfg):
+            signal = "big"
         if stats:
             wins, losses, roi = stats
             stats_line = f"**{label} is {wins}-{losses}** · {roi:+.0f}% ROI"
@@ -605,6 +628,8 @@ def build_alert(play, wallet, profile, cfg):
         header, colour = f"↩️ {name} sold{size_txt}", PURPLE
     elif signal == "green":
         header, colour = f"🟢 GREEN LIGHT · {name}{size_txt} play!", GREEN
+    elif signal == "big":
+        header, colour = f"🟡 BIG PLAY · {name}{size_txt} play!", GOLD
     elif signal == "fade":
         header, colour = f"🔴 FADE · {name}{size_txt} play", RED
     else:
@@ -623,6 +648,8 @@ def build_alert(play, wallet, profile, cfg):
         lines.append(stats_line)
     lines.append(f"**{verb}: {outcome} {odds}**  (${play['usd']:,.0f} @ {price * 100:.0f}¢)")
     lines.append(f"[{title}]({market_url})" if market_url else title)
+    if cfg.get("novig_url") and side == "BUY":
+        lines.append(f"🎯 [Bet on Novig]({cfg['novig_url']}) · search \"{outcome}\"")
 
     fills = len(play["fills"])
     embed = {
@@ -743,9 +770,9 @@ def process_wallet(wallet, state, webhook_url, cfg):
     # Keep only the plays worth acting on (see ALERTS setting).
     found = len(plays)
     if cfg["alerts"] == "green":
-        plays = [p for p in plays if play_signal(p, profile, cfg) == "green"]
+        plays = [p for p in plays if play_signal(p, profile, cfg) in ("green", "big")]
     elif cfg["alerts"] == "signals":
-        plays = [p for p in plays if play_signal(p, profile, cfg) in ("green", "fade")]
+        plays = [p for p in plays if play_signal(p, profile, cfg) in ("green", "big", "fade")]
     filtered_out = found - len(plays)
     skipped = 0
     if len(plays) > cfg["max_alerts"]:
@@ -792,6 +819,30 @@ def process_wallet(wallet, state, webhook_url, cfg):
     return posted, report
 
 
+def send_preview(webhook_url, cfg):
+    """
+    python tracker.py --preview
+    Posts one made-up GREEN LIGHT alert so you can see the layout and test the
+    links. Reads no wallets and doesn't touch state.json.
+    """
+    now = int(time.time())
+    fills = [{"usdcSize": 1400}, {"usdcSize": 2100}, {"usdcSize": 1662}]
+    play = {"side": "BUY", "outcome": "Thunder", "price": 0.35, "usd": 5162.0,
+            "title": "Thunder vs. Trail Blazers", "eventSlug": "",
+            "timestamp": now, "fills": fills}
+    profile = {"unit": 2450, "buckets": {
+        "<1u": {"w": 30, "l": 28, "stake": 40000, "pnl": 1200},
+        "1-3u": {"w": 41, "l": 26, "stake": 160000, "pnl": 38000},
+        "3-5u": {"w": 12, "l": 8, "stake": 90000, "pnl": 19000},
+        "5u+": {"w": 6, "l": 4, "stake": 70000, "pnl": 9000}}}
+    wallet = {"address": "0x" + "0" * 40, "label": "PreviewWhale"}
+    preview_cfg = dict(cfg, min_sample=15)
+    embed = build_alert(play, wallet, profile, preview_cfg)
+    embed["footer"] = {"text": "PREVIEW - not a real play"}
+    post_to_discord(webhook_url, embeds=[embed])
+    print("Preview alert posted to Discord.")
+
+
 def main():
     webhook_url = setting("DISCORD_WEBHOOK_URL", DISCORD_WEBHOOK_URL)
     default_min = setting("DEFAULT_MIN_TRADE_USD", DEFAULT_MIN_TRADE_USD, float)
@@ -805,12 +856,18 @@ def main():
         "refresh_days": setting("PROFILE_REFRESH_DAYS", PROFILE_REFRESH_DAYS, float),
         "weekly_report": setting("WEEKLY_REPORT", WEEKLY_REPORT, int),
         "alerts": setting("ALERTS", ALERTS).lower(),
+        "novig_url": setting("NOVIG_URL", NOVIG_URL),
+        "big_units": setting("BIG_PLAY_UNITS", BIG_PLAY_UNITS, float),
     }
     if cfg["alerts"] not in ("green", "signals", "all"):
         sys.exit("ERROR: ALERTS must be green, signals or all")
     if not webhook_url.startswith("https://"):
         sys.exit("ERROR: no Discord webhook. Set DISCORD_WEBHOOK_URL at the top "
                  "of tracker.py (local) or as a GitHub secret.")
+    if "--preview" in sys.argv:
+        send_preview(webhook_url, cfg)
+        return
+
     wallets = load_wallets(default_min)
     if not wallets:
         sys.exit("ERROR: no wallets. Add them to wallets.txt (local) or the "
