@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 
 # Local use: paste your Discord webhook URL between the quotes.
 # GitHub Actions: LEAVE THIS BLANK and use the DISCORD_WEBHOOK_URL secret.
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1339001578648113205/BtVwtwj1sR1D2yHjWBQzC771CZK-iXgrhc2RVH96p2TiAYyc1gxk3RcKL56NLc2mWYHs"
+DISCORD_WEBHOOK_URL = ""
 
 # Plays smaller than this many USDC are ignored, unless the wallet has its
 # own minimum in the wallet list. Split fills are added up first, so a
