@@ -417,9 +417,9 @@
     {
       "name": "PinkToe",
       "outcome": "Grizzlies",
-      "pnl": null,
+      "pnl": 0.608,
       "price": 0.6219,
-      "result": null,
+      "result": "W",
       "signal": "green",
       "title": "Grizzlies vs. Pelicans",
       "token": "69983077339239750112434338312136223847931211223617544712666878870022545420357",
@@ -443,9 +443,9 @@
     {
       "name": "BagHolder",
       "outcome": "Over",
-      "pnl": null,
+      "pnl": -1.0,
       "price": 0.5191,
-      "result": null,
+      "result": "L",
       "signal": "big",
       "title": "Knicks vs. Pacers: O/U 214.5",
       "token": "57019600849405006230037292504010754937578166179055173749683287224192121728777",
@@ -456,9 +456,9 @@
     {
       "name": "BagHolder",
       "outcome": "Over",
-      "pnl": null,
+      "pnl": 0.951,
       "price": 0.5125,
-      "result": null,
+      "result": "W",
       "signal": "green",
       "title": "Grizzlies vs. Pelicans: O/U 243.5",
       "token": "103788893095873232995009324055397762887634927998819111798178757364026075521934",
@@ -469,9 +469,9 @@
     {
       "name": "BagHolder",
       "outcome": "Over",
-      "pnl": null,
+      "pnl": 1.073,
       "price": 0.4825,
-      "result": null,
+      "result": "W",
       "signal": "green",
       "title": "Jazz vs. Rockets: O/U 230.5",
       "token": "54082130523580699541658347755463341322336879380121768269271286831489091970702",
@@ -481,7 +481,7 @@
     }
   ],
   "_meta": {
-    "graded_at": 1794624039,
+    "graded_at": 1794636026,
     "scorecard_at": 1794531632
   },
   "a46d79622e31ebcc": {
