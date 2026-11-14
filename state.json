@@ -430,9 +430,9 @@
     {
       "name": "FurrSure",
       "outcome": "Thunder",
-      "pnl": null,
+      "pnl": -1.0,
       "price": 0.71,
-      "result": null,
+      "result": "L",
       "signal": "green",
       "title": "Thunder vs. Clippers",
       "token": "97468444083711332175492423329140422512182369789679568257449061247787123038993",
@@ -481,7 +481,7 @@
     }
   ],
   "_meta": {
-    "graded_at": 1794636026,
+    "graded_at": 1794646829,
     "scorecard_at": 1794531632
   },
   "a46d79622e31ebcc": {
