@@ -561,9 +561,9 @@
     {
       "name": "FurrSure",
       "outcome": "Pistons",
-      "pnl": null,
+      "pnl": -1.0,
       "price": 0.6,
-      "result": null,
+      "result": "L",
       "signal": "green",
       "title": "Pistons vs. Heat",
       "token": "108219704549399147171726985345356262239199361318934193188133077315032734690573",
@@ -665,9 +665,9 @@
     {
       "name": "FurrSure",
       "outcome": "Josh Hokit",
-      "pnl": null,
+      "pnl": -1.0,
       "price": 0.33,
-      "result": null,
+      "result": "L",
       "signal": "green",
       "title": "UFC 334: Josh Hokit vs. Ciryl Gane (Heavyweight, Main Card)",
       "token": "30289940090088667668050088376461003061362172048916753227271073157706533834577",
@@ -678,9 +678,9 @@
     {
       "name": "FurrSure",
       "outcome": "Josh Hokit",
-      "pnl": null,
+      "pnl": -1.0,
       "price": 0.33,
-      "result": null,
+      "result": "L",
       "signal": "green",
       "title": "UFC 334: Josh Hokit vs. Ciryl Gane (Heavyweight, Main Card)",
       "token": "30289940090088667668050088376461003061362172048916753227271073157706533834577",
@@ -691,9 +691,9 @@
     {
       "name": "CBTM",
       "outcome": "Kayla Harrison",
-      "pnl": null,
+      "pnl": 0.608,
       "price": 0.6219,
-      "result": null,
+      "result": "W",
       "signal": "green",
       "title": "UFC 334: Amanda Nunes vs. Kayla Harrison (Women's Bantamweight, Main Card)",
       "token": "23208862140288254610121187571883191387693350915948952229094473665636902270938",
@@ -703,7 +703,7 @@
     }
   ],
   "_meta": {
-    "graded_at": 1794715235,
+    "graded_at": 1794727831,
     "scorecard_at": 1794531632
   },
   "a46d79622e31ebcc": {
