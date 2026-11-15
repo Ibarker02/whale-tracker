@@ -235,7 +235,7 @@
     ]
   },
   "5dee14202c3b393c": {
-    "last_ts": 1794712045,
+    "last_ts": 1794715180,
     "profile": {
       "buckets": {
         "1-3u": {
@@ -271,7 +271,11 @@
       "version": 2
     },
     "seen": [
-      "0xe08ef8f2ee2050d37e9901badf8744cd40661f7842f1602c168ae484aca63fa2|40217535979594382892270035974395609778209345077929307812668700224114300427620|BUY|1666.666667|0.03"
+      "0x00077e5564fc5482e8edf3fbeada1f07e1ed74edffd4c3a60f33f67c14b5bedd|30289940090088667668050088376461003061362172048916753227271073157706533834577|BUY|3.432836|0.330000035",
+      "0x2d5331d5a261b12575a1c2bc31e0b4fdc73392c77f42fa8245089c808f7d1576|30289940090088667668050088376461003061362172048916753227271073157706533834577|BUY|388.0597|0.33",
+      "0x671122938696b92f2d3db560dabe43b034e86545959742ea6335a420d9ddee7c|30289940090088667668050088376461003061362172048916753227271073157706533834577|BUY|746.268657|0.3300000003",
+      "0xc40be5e339917bd60cd29c9404abe45094aeadb28f2e9878dde255aed0d46ac7|30289940090088667668050088376461003061362172048916753227271073157706533834577|BUY|58.626866|0.3300000038",
+      "0xf39d9b49824d99bd4e24313eeb90f0ee9fc1bf7a381b93fffd83b226392f5d7f|30289940090088667668050088376461003061362172048916753227271073157706533834577|BUY|30.0|0.33"
     ]
   },
   "6723eec9f037a450": {
@@ -499,9 +503,9 @@
     {
       "name": "FurrSure",
       "outcome": "Grizzlies",
-      "pnl": null,
+      "pnl": 0.695,
       "price": 0.59,
-      "result": null,
+      "result": "W",
       "signal": "green",
       "title": "Nets vs. Grizzlies",
       "token": "3579412489280864955800901839533298087003308036595630976581663622607856824818",
@@ -590,9 +594,9 @@
     {
       "name": "ShadowTrader",
       "outcome": "Bilibili Gaming",
-      "pnl": null,
+      "pnl": 0.001,
       "price": 0.999,
-      "result": null,
+      "result": "W",
       "signal": "green",
       "title": "LoL: Bilibili Gaming vs Gen.G - Game 3 Winner",
       "token": "90044666570905159714394090954679431565743091242456162440295501036209785845721",
@@ -603,9 +607,9 @@
     {
       "name": "PinkToe",
       "outcome": "Oilers",
-      "pnl": null,
+      "pnl": 0.689,
       "price": 0.5922,
-      "result": null,
+      "result": "W",
       "signal": "green",
       "title": "Oilers vs. Maple Leafs",
       "token": "60279319209539335814141996577888438153061818229995512786247661614914492861736",
@@ -616,9 +620,9 @@
     {
       "name": "PinkToe",
       "outcome": "Grizzlies",
-      "pnl": null,
+      "pnl": 0.569,
       "price": 0.6375,
-      "result": null,
+      "result": "W",
       "signal": "green",
       "title": "Nets vs. Grizzlies",
       "token": "3579412489280864955800901839533298087003308036595630976581663622607856824818",
@@ -651,10 +655,36 @@
       "ts": 1794710887,
       "units": 3.35,
       "wallet": "5dee14202c3b393c"
+    },
+    {
+      "name": "FurrSure",
+      "outcome": "Kevin Holland",
+      "pnl": null,
+      "price": 0.54,
+      "result": null,
+      "signal": "green",
+      "title": "UFC 334: Kevin Holland vs. Uro\u0161 Medic (Welterweight, Main Card)",
+      "token": "34717719393900922849944382031712742833012474823431263540945245516600188424297",
+      "ts": 1794713890,
+      "units": 7.3,
+      "wallet": "5dee14202c3b393c"
+    },
+    {
+      "name": "FurrSure",
+      "outcome": "Josh Hokit",
+      "pnl": null,
+      "price": 0.33,
+      "result": null,
+      "signal": "green",
+      "title": "UFC 334: Josh Hokit vs. Ciryl Gane (Heavyweight, Main Card)",
+      "token": "30289940090088667668050088376461003061362172048916753227271073157706533834577",
+      "ts": 1794715180,
+      "units": 5.08,
+      "wallet": "5dee14202c3b393c"
     }
   ],
   "_meta": {
-    "graded_at": 1794704431,
+    "graded_at": 1794715235,
     "scorecard_at": 1794531632
   },
   "a46d79622e31ebcc": {
