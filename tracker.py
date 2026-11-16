@@ -29,6 +29,7 @@ same name, which is how the GitHub Actions version gets its secrets.
 
 import hashlib
 import json
+import math
 import os
 import statistics
 import sys
@@ -77,16 +78,37 @@ ALERTS = "green"
 # 0 = turn off.
 BIG_PLAY_UNITS = 3
 
+# --- 🔵 Whale Model official picks ---
+# The best plays across ALL your wallets, posted as official picks.
+OFFICIAL_PICKS = 1           # 1 = on, 0 = off
+OFFICIAL_WEBHOOK_URL = ""    # separate channel for official picks (local use);
+                             # on GitHub use the OFFICIAL_WEBHOOK_URL secret.
+                             # Blank = post in the main channel.
+OFFICIAL_MIN_SAFE_ROI = 5    # bucket ROI minus its luck range must be >= this %
+OFFICIAL_MIN_UNITS = 2       # only the wallet's bigger bets (this many units+)
+CONSENSUS_HOURS = 24         # 2+ wallets on the same side within this = pick
+COLD_AFTER = 10              # wallet's graded alerts needed before "cold" check
+
 # --- Alert scorecard ---
 # Every 🟢 / 🟡 alert is remembered and graded once its market settles, as if
 # you bet 1u on it at the alert price. A scorecard posts every SCORECARD_DAYS.
-SCORECARD_DAYS = 2.3           # 0 = never post the scorecard
+SCORECARD_DAYS = 7           # 0 = never post the scorecard
 GRADE_EVERY_HOURS = 3        # how often to check whether alerted games settled
 ALERT_EXPIRE_DAYS = 30       # alerts still unsettled after this are dropped
 
 # Adds a "Bet on Novig" link to every buy alert. Paste a different address
 # here if the one you use is different; leave blank ("") to hide the link.
 NOVIG_URL = ""
+
+# Buys priced above this (e.g. 0.90 = 90¢) pay almost nothing, so they are
+# ignored everywhere: no alerts, and left out of grading. 1 = keep them all.
+MAX_BUY_PRICE = 0.90
+
+# Sport-level grading: a play is judged on the wallet's record in THAT sport
+# once the sport has MIN_SAMPLE plays at that size. A sport where the wallet
+# is losing (SPORT_VETO_PLAYS+ plays, negative ROI) blocks green lights.
+SPORT_GRADING = 1
+SPORT_VETO_PLAYS = 5
 
 # Safety cap so one hyperactive wallet can't flood the channel. If a wallet
 # has more plays than this in one run, only the largest are posted, plus a
@@ -111,11 +133,42 @@ MIN_HISTORY_DAYS = 14        # very active wallets: shrink the grading window
 POSITIONS_PAGE = 1000        # the positions endpoint allows 1000 per page
 OVERLAP_SECONDS = 300        # re-check the last 5 minutes each run in case the
                              # API indexed a trade late; duplicates are filtered
-GRADER_VERSION = 2           # bumped when grading changes -> everyone re-grades
+GRADER_VERSION = 3           # bumped when grading changes -> everyone re-grades
 USER_AGENT = "polymarket-whale-tracker/2.1"   # Discord rejects Python's default
 
 # Size buckets used for grading: (from units, up to units, label)
 BUCKETS = [(0, 1, "<1u"), (1, 3, "1-3u"), (3, 5, "3-5u"), (5, float("inf"), "5u+")]
+
+# Event slugs start with the league code, e.g. "nba-cle-nyk-2026-11-11".
+LEAGUES = {
+    "nba": "NBA", "nfl": "NFL", "nhl": "NHL", "mlb": "MLB", "wnba": "WNBA",
+    "cbb": "CBB", "ncaab": "CBB", "cwbb": "CBB", "cfb": "CFB", "ncaaf": "CFB",
+    "epl": "Soccer", "lal": "Soccer", "laliga": "Soccer", "es2": "Soccer",
+    "sea": "Soccer", "bun": "Soccer", "fl1": "Soccer", "ucl": "Soccer",
+    "uel": "Soccer", "uecl": "Soccer", "unl": "Soccer", "mls": "Soccer",
+    "fif": "Soccer", "fifa": "Soccer", "fifwc": "Soccer", "wc": "Soccer",
+    "bra": "Soccer", "bra2": "Soccer", "arg": "Soccer", "argcopa": "Soccer",
+    "por": "Soccer", "ere": "Soccer", "efl": "Soccer", "spl": "Soccer",
+    "atp": "Tennis", "wta": "Tennis", "itf": "Tennis", "ufc": "MMA",
+    "cs2": "Esports", "lol": "Esports", "dota2": "Esports", "val": "Esports",
+}
+
+
+def sport_of(item):
+    """Sport for a play or position, from its event slug (or title)."""
+    slug = str(item.get("event_slug") or item.get("eventSlug")
+               or item.get("slug") or "").lower()
+    prefix = slug.split("-")[0] if slug else ""
+    if prefix in LEAGUES:
+        return LEAGUES[prefix]
+    title = str(item.get("title") or "")
+    for word, sport in (("Counter-Strike", "Esports"), ("LoL", "Esports"),
+                        ("Dota", "Esports"), ("ATP", "Tennis"), ("WTA", "Tennis"),
+                        ("UFC", "MMA")):
+        if word in title:
+            return sport
+    return prefix.upper() or "Other"
+
 
 # Embed colours
 GREEN, RED = 0x2ECC71, 0xE74C3C
@@ -151,8 +204,11 @@ def parse_wallets(text, default_min):
         0xADDRESS, 500, BigFish             <- + nickname
         0xADDRESS, BigFish, unit=250        <- + fixed unit size of $250
         0xADDRESS, min=1000, unit=500, name=Sharp Guy
+        0xADDRESS, name=EdgeHunter, track=700   <- always post buys $700+
 
     A bare number is the minimum. `unit=` overrides the calculated unit.
+    `track=` posts every buy of that many USDC or more as 👀 TRACKING, even
+    when it isn't a green light, and grades it on the scorecard.
     Anything after a # is a comment. Returns a list of dicts.
     """
     wallets, seen = [], set()
@@ -174,7 +230,7 @@ def parse_wallets(text, default_min):
         seen.add(address)
 
         wallet = {"address": address, "min_usd": default_min,
-                  "label": "", "unit_override": None}
+                  "label": "", "unit_override": None, "track_usd": None}
         for part in parts[1:]:
             try:
                 if "=" in part:
@@ -184,6 +240,8 @@ def parse_wallets(text, default_min):
                         wallet["min_usd"] = to_number(value)
                     elif key == "unit":
                         wallet["unit_override"] = to_number(value)
+                    elif key == "track":
+                        wallet["track_usd"] = to_number(value)
                     elif key in ("name", "label"):
                         wallet["label"] = value
                     else:
@@ -480,24 +538,32 @@ def build_profile(wallet, history_days):
             stake = num(p.get("total_cost_usdc")) or num(p.get("entry_cost_usdc"))
         if stake < 1:
             continue                        # dust
+        if num(p.get("avg_price")) > MAX_BUY_PRICE:
+            continue                        # heavy favourite - not followable
         if p.get("total_pnl") is not None:
             pnl = num(p.get("total_pnl"))
         else:
             pnl = num(p.get("realized_pnl")) + num(p.get("unrealized_pnl"))
-        plays.append((stake, pnl))
+        plays.append((stake, pnl, sport_of(p)))
 
     unit = wallet["unit_override"]
     if not unit and len(plays) >= 5:
-        unit = statistics.median(stake for stake, _ in plays)
+        unit = statistics.median(stake for stake, _, _ in plays)
 
-    buckets = {label: {"w": 0, "l": 0, "stake": 0.0, "pnl": 0.0}
-               for _, _, label in BUCKETS}
+    def empty():
+        return {label: {"w": 0, "l": 0, "stake": 0.0, "pnl": 0.0}
+                for _, _, label in BUCKETS}
+    buckets, sports = empty(), {}
     if unit:
-        for stake, pnl in plays:
-            b = buckets[bucket_for(stake / unit)]
-            b["w" if pnl > 0 else "l"] += 1
-            b["stake"] += stake
-            b["pnl"] += pnl
+        for stake, pnl, sport in plays:
+            size = bucket_for(stake / unit)
+            for b in (buckets[size], sports.setdefault(sport, empty())[size]):
+                b["w" if pnl > 0 else "l"] += 1
+                b["stake"] += stake
+                b["pnl"] += pnl
+        # Only keep sports with enough plays to matter (keeps state small).
+        sports = {sp: bk for sp, bk in sports.items() if sp != "Other"
+                  and sum(b["w"] + b["l"] for b in bk.values()) >= SPORT_VETO_PLAYS}
 
     return {
         "unit": round(unit, 2) if unit else None,
@@ -505,20 +571,27 @@ def build_profile(wallet, history_days):
         "graded": len(plays),
         "days": max(1, round((time.time() - since) / 86400)),
         "buckets": buckets,
+        "sports": sports,
         "updated": int(time.time()),
         "version": GRADER_VERSION,
     }
 
 
-def bucket_stats(profile, label):
+def buckets_of(profile, sport=None):
+    if sport:
+        return ((profile or {}).get("sports") or {}).get(sport) or {}
+    return (profile or {}).get("buckets", {})
+
+
+def bucket_stats(profile, label, sport=None):
     """Return (wins, losses, roi_percent) for one bucket, or None."""
-    b = (profile or {}).get("buckets", {}).get(label)
+    b = buckets_of(profile, sport).get(label)
     if not b or not b["stake"]:
         return None
     return b["w"], b["l"], 100 * b["pnl"] / b["stake"]
 
 
-def size_stats(profile, units):
+def size_stats(profile, units, sport=None):
     """
     Record for plays of THIS size or bigger, e.g. a 3.2u play is judged on
     every 3u+ play ("3u+ is 10-0"). Plays under 1u use the <1u bucket only.
@@ -526,17 +599,38 @@ def size_stats(profile, units):
     """
     label = bucket_for(units)
     if label == BUCKETS[0][2]:
-        return label, bucket_stats(profile, label)
+        return label, bucket_stats(profile, label, sport)
     low = next(lo for lo, _, lab in BUCKETS if lab == label)
     w = l = 0
     stake = pnl = 0.0
     for lo, _, lab in BUCKETS:
-        b = (profile or {}).get("buckets", {}).get(lab)
+        b = buckets_of(profile, sport).get(lab)
         if lo >= low and b:
             w, l = w + b["w"], l + b["l"]
             stake, pnl = stake + b["stake"], pnl + b["pnl"]
     name = f"{low:g}u+"
     return name, ((w, l, 100 * pnl / stake) if stake else None)
+
+
+def judge(profile, units, sport, cfg):
+    """
+    The record a play is judged on: (label, (wins, losses, roi)).
+      * The wallet's record in THIS sport at this size and up, once that has
+        MIN_SAMPLE plays - e.g. "NBA 3u+ is 40-20".
+      * If the sport is losing at this size (a few plays, negative ROI), that
+        losing record is returned so the play can't get a green light.
+      * Otherwise the wallet's all-sports record.
+    """
+    label, overall = size_stats(profile, units)
+    if cfg.get("sport_grading") and sport:
+        slabel, sstats = size_stats(profile, units, sport)
+        if sstats:
+            n = sstats[0] + sstats[1]
+            if n >= cfg["min_sample"]:
+                return f"{sport} {slabel}", sstats
+            if n >= SPORT_VETO_PLAYS and sstats[2] < 0:
+                return f"{sport} {slabel}", sstats
+    return label, overall
 
 
 def american_odds(price):
@@ -580,17 +674,27 @@ def size_colour(units):
     return ORANGE
 
 
-def play_signal(play, profile, cfg):
-    """'green', 'fade' or None for one play (sells never get a signal)."""
-    unit = (profile or {}).get("unit")
-    if not unit or play.get("side") != "BUY":
+def play_signal(play, profile, cfg, wallet=None):
+    """'green', 'big', 'fade', 'watch' or None (sells never get a signal)."""
+    if play.get("side") != "BUY":
         return None
+    unit = (profile or {}).get("unit")
+    if not unit:
+        return "watch" if is_tracked(play, wallet) else None
     units = play["usd"] / unit
-    _, stats = size_stats(profile, units)
+    _, stats = judge(profile, units, sport_of(play), cfg)
     signal = signal_for(stats, cfg["min_sample"], cfg["green_roi"], cfg["fade_roi"])
     if signal is None and is_big_play(units, stats, cfg):
         signal = "big"
+    if signal is None and is_tracked(play, wallet):
+        signal = "watch"
     return signal
+
+
+def is_tracked(play, wallet):
+    """A buy at or above the wallet's track= amount."""
+    track = (wallet or {}).get("track_usd")
+    return bool(track) and play.get("side") == "BUY" and play["usd"] >= track
 
 
 def is_big_play(units, stats, cfg):
@@ -620,7 +724,7 @@ def build_alert(play, wallet, profile, cfg):
     # The signal only applies to buys - a sell is the wallet exiting.
     signal, stats_line = None, ""
     if units is not None and side == "BUY":
-        label, stats = size_stats(profile, units)
+        label, stats = judge(profile, units, sport_of(play), cfg)
         signal = signal_for(stats, cfg["min_sample"], cfg["green_roi"], cfg["fade_roi"])
         if signal is None and is_big_play(units, stats, cfg):
             signal = "big"
@@ -630,11 +734,15 @@ def build_alert(play, wallet, profile, cfg):
             if wins + losses < cfg["min_sample"]:
                 stats_line += " (small sample)"
 
+    if signal is None and is_tracked(play, wallet):
+        signal = "watch"
     size_txt = f" {units:.1f}u" if units is not None else ""
     if side == "SELL":
         header, colour = f"↩️ {name} sold{size_txt}", PURPLE
     elif signal == "green":
         header, colour = f"🟢 GREEN LIGHT · {name}{size_txt} play!", GREEN
+    elif signal == "watch":
+        header, colour = f"👀 TRACKING · {name}{size_txt} play", GREY
     elif signal == "big":
         header, colour = f"🟡 BIG PLAY · {name}{size_txt} play!", GOLD
     elif signal == "fade":
@@ -698,6 +806,21 @@ def build_report(wallet, profile, cfg):
         body = ("```\n" + "\n".join(rows) + "\n```"
                 f"1u = **${unit:,.0f}** ({how}) · {profile['graded']} graded plays, "
                 f"last {profile.get('days', cfg['history_days'])} days")
+        # Sport edges: proven winning (🟢) and losing (🔴) sport + size spots.
+        edges = []
+        for sport in sorted(profile.get("sports") or {}):
+            for units in (1, 3, 5):
+                label, stats = size_stats(profile, units, sport)
+                sig = signal_for(stats, cfg["min_sample"], cfg["green_roi"], cfg["fade_roi"])
+                if sig:
+                    wins, losses, roi = stats
+                    edges.append((roi, f"{'🟢' if sig == 'green' else '🔴'} {sport} {label} "
+                                       f"{wins}-{losses} {roi:+.0f}%"))
+        edges.sort(reverse=True)
+        best = [e for r, e in edges if r > 0][:3]
+        worst = [e for r, e in edges if r < 0][-2:]
+        if best or worst:
+            body += "\n**Sport edges:** " + " · ".join(best + worst)
     return {
         "title": f"📊 Report card · {name}",
         "url": f"https://polymarket.com/profile/{wallet['address']}",
@@ -772,14 +895,25 @@ def process_wallet(wallet, state, webhook_url, cfg):
     new_trades = [t for t in trades if trade_id(t) not in already_seen]
 
     # Combine split fills, then apply this wallet's minimum to the whole play.
-    plays = [p for p in combine_fills(new_trades) if p["usd"] >= wallet["min_usd"]]
+    plays = [p for p in combine_fills(new_trades)
+             if p["usd"] >= wallet["min_usd"]
+             and not (p.get("side") == "BUY" and num(p.get("price")) > cfg["max_price"])]
+
+    # Every buy is a candidate for a 🔵 official pick (decided after all
+    # wallets have been checked, so plays from different wallets can be
+    # compared and matched up).
+    for p in plays:
+        if p.get("side") == "BUY":
+            cfg.setdefault("_candidates", []).append((p, wallet, profile, key))
 
     # Keep only the plays worth acting on (see ALERTS setting).
     found = len(plays)
     if cfg["alerts"] == "green":
-        plays = [p for p in plays if play_signal(p, profile, cfg) in ("green", "big")]
+        plays = [p for p in plays
+                 if play_signal(p, profile, cfg, wallet) in ("green", "big", "watch")]
     elif cfg["alerts"] == "signals":
-        plays = [p for p in plays if play_signal(p, profile, cfg) in ("green", "big", "fade")]
+        plays = [p for p in plays
+                 if play_signal(p, profile, cfg, wallet) in ("green", "big", "watch", "fade")]
     filtered_out = found - len(plays)
     skipped = 0
     if len(plays) > cfg["max_alerts"]:
@@ -833,8 +967,8 @@ def process_wallet(wallet, state, webhook_url, cfg):
 
 def record_alert(state, key, wallet, play, profile, cfg):
     """Remember a posted 🟢 / 🟡 / 🔴 alert so it can be graded later."""
-    signal = play_signal(play, profile, cfg)
-    if signal not in ("green", "big", "fade"):
+    signal = play_signal(play, profile, cfg, wallet)
+    if signal not in ("green", "big", "fade", "watch"):
         return
     unit = (profile or {}).get("unit")
     alerts = state.setdefault("_alerts", [])
@@ -938,24 +1072,28 @@ def tally_line(label, alerts):
 
 def best_play_type(profile, cfg):
     """
-    What to follow this wallet on, from its graded history:
-    the size with the best ROI that has a proven edge, else a winning
-    big-play size that's still a small sample. Returns (text, roi) or None.
+    What to follow this wallet on: the sport + size (or all-sports size) with
+    the best ROI that has a proven edge, else a winning big-play size that's
+    still a small sample. Returns (text, roi) or None.
     """
     if not (profile or {}).get("unit"):
         return None
+    scopes = [None] + (sorted((profile.get("sports") or {}).keys())
+                       if cfg.get("sport_grading") else [])
     best = None
-    for units in (1, 3, 5):
-        label, stats = size_stats(profile, units)
-        if not stats:
-            continue
-        wins, losses, roi = stats
-        if wins + losses >= cfg["min_sample"] and roi >= cfg["green_roi"]:
-            if not best or roi > best[1]:
-                best = (f"{label} plays ({wins}-{losses}, {roi:+.0f}%)", roi)
+    for sport in scopes:
+        for units in (1, 3, 5):
+            label, stats = size_stats(profile, units, sport)
+            if not stats:
+                continue
+            wins, losses, roi = stats
+            if wins + losses >= cfg["min_sample"] and roi >= cfg["green_roi"]:
+                name = f"{sport} {label}" if sport else label
+                if not best or roi > best[1]:
+                    best = (f"{name} plays ({wins}-{losses}, {roi:+.0f}%)", roi)
     if best:
         return best
-    for units in (5, 3):
+    for units in (3, 5):
         label, stats = size_stats(profile, units)
         if stats and is_big_play(units, stats, cfg):
             wins, losses, roi = stats
@@ -970,19 +1108,26 @@ def build_scorecard(state, wallets, cfg):
     recent = [a for a in alerts if a["ts"] >= week_ago]
 
     lines = ["**Last 7 days**",
+             tally_line("🔵 Whale Model", [a for a in recent if a["signal"] == "official"]),
              tally_line("🟢 Green lights", [a for a in recent if a["signal"] == "green"]),
              tally_line("🟡 Big plays", [a for a in recent if a["signal"] == "big"]),
              "",
              "**Since tracking began**",
+             tally_line("🔵 Whale Model", [a for a in alerts if a["signal"] == "official"]),
              tally_line("🟢 Green lights", [a for a in alerts if a["signal"] == "green"]),
-             tally_line("🟡 Big plays", [a for a in alerts if a["signal"] == "big"])]
+             tally_line("🟡 Big plays", [a for a in alerts if a["signal"] == "big"]),
+             ]
+    if any(a["signal"] == "watch" for a in alerts):      # only if track= is used
+        lines.insert(4, tally_line("👀 Tracking", [a for a in recent if a["signal"] == "watch"]))
+        lines.append(tally_line("👀 Tracking", [a for a in alerts if a["signal"] == "watch"]))
 
     # Wallet table: how each wallet's alerts have done (all-time).
     rows = []
     for w in wallets:
         key = state_key(w["address"])
         name = (w["label"] or short(w["address"]))[:15]
-        mine = [a for a in alerts if a["wallet"] == key and a["signal"] in ("green", "big")]
+        mine = [a for a in alerts if a["wallet"] == key
+                and a["signal"] in ("green", "big", "watch")]
         wins, losses, roi, units = tally(mine)
         rows.append((units if wins + losses else -999, name, wins, losses, roi, units))
     rows.sort(key=lambda r: r[0], reverse=True)
@@ -1028,11 +1173,134 @@ def scorecard_due(state, cfg):
     return time.time() - meta["scorecard_at"] >= days * 86400
 
 
+# ---------------------------------------------------------------------------
+# 🔵 Whale Model official picks
+# ---------------------------------------------------------------------------
+
+def safe_roi(stats):
+    """ROI minus its luck range (about ±200% / sqrt(plays))."""
+    if not stats:
+        return None
+    wins, losses, roi = stats
+    n = wins + losses
+    return roi - 200 / math.sqrt(n) if n else None
+
+
+def wallet_is_cold(state, key):
+    """True if this wallet's graded alerts are losing over a fair sample."""
+    mine = [a for a in state.get("_alerts", [])
+            if a["wallet"] == key and a["signal"] != "official"]
+    wins, losses, _, units = tally(mine)
+    return wins + losses >= COLD_AFTER and units < 0
+
+
+def pick_officials(state, cfg):
+    """
+    Choose this run's 🔵 picks from every wallet's new buys.
+    A play qualifies if EITHER
+      * proven edge: a 2u+ bet at a size where the wallet's ROI, minus the
+        luck range, is still +5% or better, and the wallet isn't cold; OR
+      * consensus: 2+ of your wallets bought the same side within 24 hours.
+    Each market side becomes an official pick only once.
+    """
+    now = int(time.time())
+    candidates = cfg.pop("_candidates", [])
+    recent = state.setdefault("_recent_buys", [])
+    for play, wallet, profile, key in candidates:
+        unit = (profile or {}).get("unit")
+        recent.append({"wallet": key, "name": wallet["label"] or short(wallet["address"]),
+                       "token": str(play.get("asset") or ""), "ts": int(play["timestamp"]),
+                       "units": round(play["usd"] / unit, 1) if unit else None})
+    keep_after = now - 2 * cfg["consensus_hours"] * 3600
+    state["_recent_buys"] = recent = [r for r in recent if r["ts"] >= keep_after]
+    done = set(state.setdefault("_official_tokens", []))
+
+    picks = []
+    for play, wallet, profile, key in candidates:
+        token = str(play.get("asset") or "")
+        if not token or token in done:
+            continue
+        unit = (profile or {}).get("unit")
+        units = play["usd"] / unit if unit else None
+        label, stats = (judge(profile, units, sport_of(play), cfg) if units
+                        else (None, None))
+
+        window = play["timestamp"] - cfg["consensus_hours"] * 3600
+        others = {}
+        for r in recent:
+            if r["token"] == token and r["wallet"] != key and r["ts"] >= window:
+                others[r["wallet"]] = r
+        consensus = len(others) >= 1
+
+        sr = safe_roi(stats)
+        proven = (units is not None and units >= cfg["official_units"]
+                  and sr is not None and sr >= cfg["official_safe_roi"]
+                  and not wallet_is_cold(state, key))
+        if not (proven or consensus):
+            continue
+        done.add(token)
+        picks.append({"play": play, "wallet": wallet, "key": key, "units": units,
+                      "label": label, "stats": stats, "others": list(others.values()),
+                      "why": "proven edge" if proven else "consensus"})
+    state["_official_tokens"] = sorted(done)[-2000:]
+    return picks
+
+
+def build_official(pick):
+    play, wallet = pick["play"], pick["wallet"]
+    name = wallet["label"] or short(wallet["address"])
+    price = num(play.get("price"))
+    slug = play.get("eventSlug") or play.get("slug")
+    market_url = f"https://polymarket.com/event/{slug}" if slug else None
+    title = (play.get("title") or "Unknown market")[:200]
+
+    who = f"**{name}**"
+    if pick["units"] is not None:
+        who += f" {pick['units']:.1f}u"
+    if pick["stats"]:
+        wins, losses, roi = pick["stats"]
+        who += f" · {pick['label']} is {wins}-{losses} · {roi:+.0f}% ROI"
+    lines = [f"**Play: {play.get('outcome') or '?'} {american_odds(price)}**  "
+             f"(${play['usd']:,.0f} @ {price * 100:.0f}¢)",
+             who]
+    for o in pick["others"]:
+        size = f" ({o['units']}u)" if o.get("units") else ""
+        lines.append(f"+ **{o['name']}** also on it{size}")
+    lines.append(f"[{title}]({market_url})" if market_url else title)
+    why = ("Proven edge at this bet size" if pick["why"] == "proven edge"
+           else f"{len(pick['others']) + 1} of your wallets on the same side")
+    return {
+        "title": "🔵 WHALE MODEL PICK",
+        "url": market_url or f"https://polymarket.com/profile/{wallet['address']}",
+        "description": "\n".join(lines),
+        "color": BLUE,
+        "footer": {"text": why},
+        "timestamp": datetime.fromtimestamp(play["timestamp"], tz=timezone.utc).isoformat(),
+    }
+
+
+def record_official(state, pick):
+    play = pick["play"]
+    state.setdefault("_alerts", []).append({
+        "wallet": pick["key"],
+        "name": pick["wallet"]["label"] or short(pick["wallet"]["address"]),
+        "signal": "official",
+        "token": str(play.get("asset") or ""),
+        "outcome": play.get("outcome"),
+        "title": play.get("title"),
+        "price": round(num(play.get("price")), 4),
+        "units": round(pick["units"], 2) if pick["units"] else None,
+        "ts": int(play["timestamp"]),
+        "result": None,
+        "pnl": None,
+    })
+
+
 def send_preview(webhook_url, cfg):
     """
     python tracker.py --preview
-    Posts one made-up GREEN LIGHT alert so you can see the layout and test the
-    links. Reads no wallets and doesn't touch state.json.
+    Posts a made-up GREEN LIGHT alert and a made-up weekly scorecard so you
+    can see the layouts. Reads no wallets and doesn't touch state.json.
     """
     now = int(time.time())
     fills = [{"usdcSize": 1400}, {"usdcSize": 2100}, {"usdcSize": 1662}]
@@ -1049,7 +1317,53 @@ def send_preview(webhook_url, cfg):
     embed = build_alert(play, wallet, profile, preview_cfg)
     embed["footer"] = {"text": "PREVIEW - not a real play"}
     post_to_discord(webhook_url, embeds=[embed])
-    print("Preview alert posted to Discord.")
+
+    # A sample weekly scorecard with made-up wallets and results.
+    names = {"TrustMeBro": [("green", "W", .52), ("green", "W", .48), ("green", "L", .55),
+                            ("green", "W", .40), ("big", "W", .35), ("green", "L", .60)],
+             "DiamondHands": [("big", "W", .58), ("big", "W", .45), ("green", "L", .50),
+                              ("big", "W", .62)],
+             "ShadowTrader": [("green", "L", .47), ("green", "W", .30), ("green", "L", .52)],
+             "Fvalp": []}
+    def fp(b):   # build a fake profile from {bucket: (wins, losses, stake, pnl)}
+        return {"unit": 2000, "buckets": {
+            lab: dict(zip(("w", "l", "stake", "pnl"), b.get(lab, (0, 0, 0.0, 0.0))))
+            for _, _, lab in BUCKETS}}
+    fake_profiles = [
+        fp({"<1u": (53, 43, 50000, 10500), "1-3u": (41, 26, 120000, 32400)}),
+        fp({"<1u": (23, 29, 30000, -8700), "3-5u": (7, 0, 50000, 26000), "5u+": (3, 0, 40000, 20000)}),
+        fp({"1-3u": (56, 23, 150000, 64500), "5u+": (105, 43, 900000, 18000)}),
+        fp({"<1u": (20, 22, 20000, -500)})]
+    fake_wallets, fake_state, alerts = [], {"_alerts": []}, []
+    for i, (name, results) in enumerate(names.items()):
+        address = "0x" + str(i + 1) * 40
+        key = state_key(address)
+        fake_wallets.append({"address": address, "label": name})
+        fake_state[key] = {"profile": fake_profiles[i]}
+        for signal, result, price in results:
+            alerts.append({"wallet": key, "signal": signal, "ts": now - 86400,
+                           "result": result, "price": price,
+                           "pnl": round((1 - price) / price, 3) if result == "W" else -1.0})
+    for result, price in [("W", .45), ("W", .52), ("L", .50), ("W", .38)]:
+        alerts.append({"wallet": state_key(fake_wallets[0]["address"]), "signal": "official",
+                       "ts": now - 86400, "result": result, "price": price,
+                       "pnl": round((1 - price) / price, 3) if result == "W" else -1.0})
+    alerts.append({"wallet": state_key(fake_wallets[0]["address"]), "signal": "green",
+                   "ts": now, "result": None, "price": .5, "pnl": None})
+    fake_state["_alerts"] = alerts
+    official = build_official({
+        "play": dict(play, outcome="Thunder"), "wallet": {"address": wallet["address"],
+                                                          "label": "TrustMeBro"},
+        "units": 2.1, "label": "1u+", "stats": (59, 38, 21.0),
+        "others": [{"name": "BagHolder", "units": 1.8}], "why": "proven edge"})
+    official["footer"] = {"text": "PREVIEW - not a real pick"}
+    post_to_discord(setting("OFFICIAL_WEBHOOK_URL", OFFICIAL_WEBHOOK_URL) or webhook_url,
+                    embeds=[official])
+
+    card = build_scorecard(fake_state, fake_wallets, preview_cfg)
+    card["footer"] = {"text": "PREVIEW - made-up numbers"}
+    post_to_discord(webhook_url, embeds=[card])
+    print("Preview alert, official pick and scorecard posted to Discord.")
 
 
 def main():
@@ -1068,7 +1382,14 @@ def main():
         "novig_url": setting("NOVIG_URL", NOVIG_URL),
         "big_units": setting("BIG_PLAY_UNITS", BIG_PLAY_UNITS, float),
         "scorecard_days": setting("SCORECARD_DAYS", SCORECARD_DAYS, float),
+        "max_price": setting("MAX_BUY_PRICE", MAX_BUY_PRICE, float),
+        "sport_grading": setting("SPORT_GRADING", SPORT_GRADING, int),
+        "official": setting("OFFICIAL_PICKS", OFFICIAL_PICKS, int),
+        "official_safe_roi": setting("OFFICIAL_MIN_SAFE_ROI", OFFICIAL_MIN_SAFE_ROI, float),
+        "official_units": setting("OFFICIAL_MIN_UNITS", OFFICIAL_MIN_UNITS, float),
+        "consensus_hours": setting("CONSENSUS_HOURS", CONSENSUS_HOURS, float),
     }
+    official_url = setting("OFFICIAL_WEBHOOK_URL", OFFICIAL_WEBHOOK_URL) or webhook_url
     if cfg["alerts"] not in ("green", "signals", "all"):
         sys.exit("ERROR: ALERTS must be green, signals or all")
     if not webhook_url.startswith("https://"):
@@ -1116,6 +1437,21 @@ def main():
             post_to_discord(webhook_url, embeds=reports[i:i + 10])
     except RuntimeError as exc:
         print(f"Report cards failed to post - {exc}")
+
+    # 🔵 Whale Model official picks: the best of this run's buys, all wallets.
+    if cfg["official"]:
+        picks = pick_officials(state, cfg)
+        try:
+            for i in range(0, len(picks), 10):
+                batch = picks[i:i + 10]
+                post_to_discord(official_url, embeds=[build_official(p) for p in batch])
+                for p in batch:
+                    record_official(state, p)
+            if picks:
+                print(f"{len(picks)} official pick(s) posted.")
+        except RuntimeError as exc:
+            print(f"Official picks failed to post - {exc}")
+    cfg.pop("_candidates", None)
 
     # Grade alerts whose games have settled; post the weekly scorecard.
     grade_alerts(state, wallets)
