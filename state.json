@@ -753,9 +753,9 @@
     {
       "name": "TrustMeBro",
       "outcome": "Over",
-      "pnl": null,
+      "pnl": -1.0,
       "price": 0.51,
-      "result": null,
+      "result": "L",
       "signal": "green",
       "title": "Seahawks vs. Raiders: O/U 40.5",
       "token": "109398308764822597909021302054714346365101911724357953966858919580636472137288",
@@ -831,9 +831,9 @@
     {
       "name": "FurrSure",
       "outcome": "Seahawks",
-      "pnl": null,
+      "pnl": 0.613,
       "price": 0.62,
-      "result": null,
+      "result": "W",
       "signal": "green",
       "title": "Seahawks vs. Raiders",
       "token": "1339463723260226502438923715546767332463073367564908774776926562714272325194",
@@ -844,9 +844,9 @@
     {
       "name": "FurrSure",
       "outcome": "49ers",
-      "pnl": null,
+      "pnl": 0.587,
       "price": 0.63,
-      "result": null,
+      "result": "W",
       "signal": "green",
       "title": "49ers vs. Cowboys",
       "token": "55797876453514533289827581042178962732253572878799251929298422210642595743616",
@@ -857,9 +857,9 @@
     {
       "name": "CBTM",
       "outcome": "49ers",
-      "pnl": null,
+      "pnl": 0.587,
       "price": 0.63,
-      "result": null,
+      "result": "W",
       "signal": "big",
       "title": "49ers vs. Cowboys",
       "token": "55797876453514533289827581042178962732253572878799251929298422210642595743616",
@@ -870,9 +870,9 @@
     {
       "name": "BagHolder",
       "outcome": "Under",
-      "pnl": null,
+      "pnl": -1.0,
       "price": 0.5225,
-      "result": null,
+      "result": "L",
       "signal": "green",
       "title": "Lakers vs. Suns: O/U 226.5",
       "token": "47304129040565716586282948650531317535913278207522957124730129828893934849116",
@@ -883,9 +883,9 @@
     {
       "name": "BagHolder",
       "outcome": "Under",
-      "pnl": null,
+      "pnl": -1.0,
       "price": 0.5124,
-      "result": null,
+      "result": "L",
       "signal": "big",
       "title": "Knicks vs. Raptors: O/U 192.5",
       "token": "1880783703931503010867882428596268822374382022373134484153491341169137337761",
@@ -895,11 +895,11 @@
     }
   ],
   "_meta": {
-    "graded_at": 1794783638,
+    "graded_at": 1794796229,
     "scorecard_at": 1794731184
   },
   "a46d79622e31ebcc": {
-    "last_ts": 1794793421,
+    "last_ts": 1794795254,
     "profile": {
       "buckets": {
         "1-3u": {
@@ -935,7 +935,7 @@
       "version": 2
     },
     "seen": [
-      "0x7a816e2611ac9d35df20ee401a98697ebbc5f2aefad29a22156d964081d7dc12|36359551864753674232840386591116591165110202765309473485118946131275625900183|BUY|18339.019231|0.5193183932"
+      "0xbe11220daa7e01dc77963abc8b577bead6b6f0366868b70150a9589b6c5a15cb|90854504304887006733160503598052714031022624561167526435796149874188902081574|BUY|12859.645834|0.48"
     ]
   },
   "ca3acaa9123e700a": {
