@@ -1578,9 +1578,9 @@
     {
       "name": "FurrSure",
       "outcome": "Thunder",
-      "pnl": null,
+      "pnl": 0.266,
       "price": 0.79,
-      "result": null,
+      "result": "W",
       "signal": "green",
       "title": "Thunder vs. Kings",
       "token": "22887021003809681753974689511242589140190914007850836973082740040299646802493",
@@ -1590,7 +1590,7 @@
     }
   ],
   "_meta": {
-    "graded_at": 1794796229,
+    "graded_at": 1794808828,
     "scorecard_at": 1794731184
   },
   "_official_tokens": [],
