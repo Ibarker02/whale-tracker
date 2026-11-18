@@ -5,7 +5,7 @@ on:
     # Every 30 minutes, at :07 and :37 past each hour (about 1,440 free
     # minutes a month - under the 2,000 a private repo gets).
     # (Off-the-hour minutes start more reliably than :00.)
-    - cron: "7,37 * * * *"
+    - cron: "*/5 * * * *"   # Every 5 minutes
   workflow_dispatch: {}   # adds a "Run workflow" button for manual runs
 
 # Needed so the job can save state.json back to the repository.
