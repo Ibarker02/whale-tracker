@@ -110,6 +110,10 @@ MAX_BUY_PRICE = 0.90
 SPORT_GRADING = 1
 SPORT_VETO_PLAYS = 5
 
+# Skip hedged plays: if a wallet buys BOTH sides of the same market within
+# this many hours, neither side is alerted. 0 = off.
+HEDGE_HOURS = 48
+
 # Safety cap so one hyperactive wallet can't flood the channel. If a wallet
 # has more plays than this in one run, only the largest are posted, plus a
 # one-line note saying how many were left out.
@@ -411,6 +415,7 @@ def normalize(row):
         "eventSlug": row.get("event_slug", row.get("eventSlug")),
         "transactionHash": row.get("transaction_hash", row.get("transactionHash")),
         "asset": row.get("token_id", row.get("asset")),
+        "condition": row.get("condition_id", row.get("conditionId")),
     }
 
 
@@ -866,6 +871,29 @@ def refresh_profile_if_due(wallet, entry, cfg):
         return False
 
 
+def find_hedges(entry, plays, cfg):
+    """
+    Return ids of buys where the wallet has bought ANOTHER outcome of the same
+    market within HEDGE_HOURS (in this run or recent runs). Also remembers this
+    run's buys so a hedge placed later can still be spotted.
+    """
+    hours = cfg.get("hedge_hours", 0)
+    if not hours:
+        return set()
+    now = int(time.time())
+    recent = [r for r in entry.get("sides", []) if r[2] >= now - hours * 3600]
+    for p in plays:
+        if p.get("side") == "BUY" and p.get("condition"):
+            recent.append([p["condition"], str(p.get("outcome")), int(p["timestamp"])])
+    entry["sides"] = recent[-500:]
+    outcomes = {}
+    for cond, outcome, _ in recent:
+        outcomes.setdefault(cond, set()).add(outcome)
+    return {id(p) for p in plays
+            if p.get("side") == "BUY" and p.get("condition")
+            and len(outcomes.get(p["condition"], ())) > 1}
+
+
 def process_wallet(wallet, state, webhook_url, cfg):
     """
     Check one wallet, post its new plays, update `state`.
@@ -895,8 +923,11 @@ def process_wallet(wallet, state, webhook_url, cfg):
     new_trades = [t for t in trades if trade_id(t) not in already_seen]
 
     # Combine split fills, then apply this wallet's minimum to the whole play.
-    plays = [p for p in combine_fills(new_trades)
+    all_plays = combine_fills(new_trades)
+    hedged = find_hedges(entry, all_plays, cfg)
+    plays = [p for p in all_plays
              if p["usd"] >= wallet["min_usd"]
+             and id(p) not in hedged
              and not (p.get("side") == "BUY" and num(p.get("price")) > cfg["max_price"])]
 
     # Every buy is a candidate for a 🔵 official pick (decided after all
@@ -915,6 +946,36 @@ def process_wallet(wallet, state, webhook_url, cfg):
         plays = [p for p in plays
                  if play_signal(p, profile, cfg, wallet) in ("green", "big", "watch", "fade")]
     filtered_out = found - len(plays)
+
+    # Log why each skipped buy didn't make the cut (shows in the GitHub run log).
+    kept = {id(p) for p in plays}
+    unit = (profile or {}).get("unit")
+    for p in all_plays:
+        if id(p) in kept or p.get("side") != "BUY":
+            continue
+        price = num(p.get("price"))
+        if id(p) in hedged:
+            why = "HEDGED - wallet bought both sides of this market"
+        elif p["usd"] < wallet["min_usd"]:
+            why = f"under min ${wallet['min_usd']:,.0f}"
+        elif price > cfg["max_price"]:
+            why = f"price {price * 100:.0f}¢ above cap"
+        elif not unit:
+            why = "wallet has no graded history yet"
+        else:
+            label, stats = judge(profile, p["usd"] / unit, sport_of(p), cfg)
+            if not stats:
+                why = f"{label}: no record"
+            else:
+                w, l, roi = stats
+                why = f"{label} {w}-{l} {roi:+.0f}%"
+                if w + l < cfg["min_sample"]:
+                    why += f" (under {cfg['min_sample']} plays)"
+                elif roi < cfg["green_roi"]:
+                    why += f" (under +{cfg['green_roi']:g}%)"
+        size = f" {p['usd'] / unit:.1f}u" if unit else ""
+        print(f"      skip: {p.get('outcome')} ${p['usd']:,.0f}{size} "
+              f"[{sport_of(p)}] - {why}")
     skipped = 0
     if len(plays) > cfg["max_alerts"]:
         skipped = len(plays) - cfg["max_alerts"]
@@ -1384,6 +1445,7 @@ def main():
         "scorecard_days": setting("SCORECARD_DAYS", SCORECARD_DAYS, float),
         "max_price": setting("MAX_BUY_PRICE", MAX_BUY_PRICE, float),
         "sport_grading": setting("SPORT_GRADING", SPORT_GRADING, int),
+        "hedge_hours": setting("HEDGE_HOURS", HEDGE_HOURS, float),
         "official": setting("OFFICIAL_PICKS", OFFICIAL_PICKS, int),
         "official_safe_roi": setting("OFFICIAL_MIN_SAFE_ROI", OFFICIAL_MIN_SAFE_ROI, float),
         "official_units": setting("OFFICIAL_MIN_UNITS", OFFICIAL_MIN_UNITS, float),
