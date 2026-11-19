@@ -110,6 +110,20 @@ MAX_BUY_PRICE = 0.90
 SPORT_GRADING = 1
 SPORT_VETO_PLAYS = 5
 
+# 🔥 HOT STREAK: a wallet that's hot in a sport over the last STREAK_DAYS.
+# Fires on 1u+ buys when, for that sport over the window:
+#   plays >= STREAK_MIN_PLAYS, ROI >= STREAK_MIN_ROI, and
+#   ROI - STREAK_Z / sqrt(plays) >= 0   (small samples need a much bigger ROI)
+# and the wallet's long-term ROI in that sport isn't worse than
+# STREAK_LONGTERM_FLOOR. Only used when the play isn't already 🟢 or 🟡.
+HOT_STREAK = 1
+STREAK_DAYS = 14
+STREAK_MIN_PLAYS = 10
+STREAK_MIN_ROI = 10
+STREAK_Z = 150
+STREAK_LONGTERM_FLOOR = -5
+STREAK_REFRESH_HOURS = 24
+
 # Skip hedged plays: if a wallet buys BOTH sides of the same market within
 # this many hours, neither side is alerted. 0 = off.
 HEDGE_HOURS = 48
@@ -691,9 +705,70 @@ def play_signal(play, profile, cfg, wallet=None):
     signal = signal_for(stats, cfg["min_sample"], cfg["green_roi"], cfg["fade_roi"])
     if signal is None and is_big_play(units, stats, cfg):
         signal = "big"
+    if signal is None and units >= 1 and hot_stats(profile, sport_of(play), cfg):
+        signal = "hot"
     if signal is None and is_tracked(play, wallet):
         signal = "watch"
     return signal
+
+
+def hot_stats(profile, sport, cfg):
+    """
+    (wins, losses, roi) for the wallet's last-14-day run in `sport` if it is a
+    qualifying hot streak, else None.
+    """
+    if not cfg.get("hot_streak") or not sport or sport == "Other":
+        return None
+    row = (((profile or {}).get("streak") or {}).get("sports") or {}).get(sport)
+    if not row:
+        return None
+    wins, losses, stake, pnl = row
+    n = wins + losses
+    if n < cfg["streak_min_plays"] or not stake:
+        return None
+    roi = 100 * pnl / stake
+    if roi < cfg["streak_min_roi"] or roi - cfg["streak_z"] / math.sqrt(n) < 0:
+        return None
+    # Long-term guardrail: not a proven loser in this sport.
+    lt = buckets_of(profile, sport)
+    lt_n = sum(b["w"] + b["l"] for b in lt.values())
+    lt_stake = sum(b["stake"] for b in lt.values())
+    if lt_n >= 5 and lt_stake:
+        if 100 * sum(b["pnl"] for b in lt.values()) / lt_stake < cfg["streak_lt_floor"]:
+            return None
+    return wins, losses, roi
+
+
+def build_streak(address, cfg):
+    """Last-STREAK_DAYS record per sport from finished positions."""
+    since = int(time.time() - cfg["streak_days"] * 86400)
+    rows = []
+    for status in ("CLOSED", "REDEEMABLE"):
+        got, _ = fetch_pages("/v2/positions", {
+            "user": address, "status": status, "start": since,
+            "sort_by": "TIMESTAMP", "sort_direction": "DESC",
+            "limit": POSITIONS_PAGE,
+        }, max_rows=MAX_HISTORY_POSITIONS)
+        rows += got
+    sports, seen = {}, set()
+    for p in rows:
+        token = p.get("token_id") or p.get("asset")
+        if token in seen:
+            continue
+        seen.add(token)
+        when = to_int(p.get("last_event_at")) or to_int(p.get("first_entry_at"))
+        if when and when < since:
+            continue
+        stake = num(p.get("total_size")) * num(p.get("avg_price"))
+        if stake < 1 or num(p.get("avg_price")) > cfg["max_price"]:
+            continue
+        pnl = (num(p.get("total_pnl")) if p.get("total_pnl") is not None
+               else num(p.get("realized_pnl")) + num(p.get("unrealized_pnl")))
+        row = sports.setdefault(sport_of(p), [0, 0, 0.0, 0.0])
+        row[0 if pnl > 0 else 1] += 1
+        row[2] += stake
+        row[3] += pnl
+    return {"updated": int(time.time()), "sports": sports}
 
 
 def is_tracked(play, wallet):
@@ -733,7 +808,14 @@ def build_alert(play, wallet, profile, cfg):
         signal = signal_for(stats, cfg["min_sample"], cfg["green_roi"], cfg["fade_roi"])
         if signal is None and is_big_play(units, stats, cfg):
             signal = "big"
-        if stats:
+        hot = (hot_stats(profile, sport_of(play), cfg)
+               if signal is None and units >= 1 else None)
+        if hot:
+            signal = "hot"
+            wins, losses, roi = hot
+            stats_line = (f"**{sport_of(play)} last {cfg['streak_days']:g} days: "
+                          f"{wins}-{losses}** · {roi:+.0f}% ROI")
+        elif stats:
             wins, losses, roi = stats
             stats_line = f"**{label} is {wins}-{losses}** · {roi:+.0f}% ROI"
             if wins + losses < cfg["min_sample"]:
@@ -746,6 +828,8 @@ def build_alert(play, wallet, profile, cfg):
         header, colour = f"↩️ {name} sold{size_txt}", PURPLE
     elif signal == "green":
         header, colour = f"🟢 GREEN LIGHT · {name}{size_txt} play!", GREEN
+    elif signal == "hot":
+        header, colour = f"🔥 HOT STREAK · {name}{size_txt} play!", ORANGE
     elif signal == "watch":
         header, colour = f"👀 TRACKING · {name}{size_txt} play", GREY
     elif signal == "big":
@@ -849,6 +933,20 @@ def post_to_discord(webhook_url, embeds=None, content=None):
 # Main logic
 # ---------------------------------------------------------------------------
 
+def refresh_streak_if_due(wallet, entry, cfg):
+    """Recompute the wallet's 14-day per-sport record once a day."""
+    profile = entry.get("profile")
+    if not cfg.get("hot_streak") or not profile:
+        return
+    streak = profile.get("streak") or {}
+    if time.time() - streak.get("updated", 0) < cfg["streak_refresh_hours"] * 3600:
+        return
+    try:
+        profile["streak"] = build_streak(wallet["address"], cfg)
+    except RuntimeError as exc:
+        print(f"  {short(wallet['address'])}: streak check failed - {exc}")
+
+
 def refresh_profile_if_due(wallet, entry, cfg):
     """
     Re-grade the wallet if it's never been graded, the weekly refresh is due,
@@ -909,6 +1007,7 @@ def process_wallet(wallet, state, webhook_url, cfg):
     entry = state[key]
 
     refreshed = refresh_profile_if_due(wallet, entry, cfg)
+    refresh_streak_if_due(wallet, entry, cfg)
     report = (build_report(wallet, entry["profile"], cfg)
               if refreshed and cfg["weekly_report"] else None)
     profile = entry.get("profile")
@@ -941,10 +1040,10 @@ def process_wallet(wallet, state, webhook_url, cfg):
     found = len(plays)
     if cfg["alerts"] == "green":
         plays = [p for p in plays
-                 if play_signal(p, profile, cfg, wallet) in ("green", "big", "watch")]
+                 if play_signal(p, profile, cfg, wallet) in ("green", "big", "hot", "watch")]
     elif cfg["alerts"] == "signals":
         plays = [p for p in plays
-                 if play_signal(p, profile, cfg, wallet) in ("green", "big", "watch", "fade")]
+                 if play_signal(p, profile, cfg, wallet) in ("green", "big", "hot", "watch", "fade")]
     filtered_out = found - len(plays)
 
     # Log why each skipped buy didn't make the cut (shows in the GitHub run log).
@@ -1029,7 +1128,7 @@ def process_wallet(wallet, state, webhook_url, cfg):
 def record_alert(state, key, wallet, play, profile, cfg):
     """Remember a posted 🟢 / 🟡 / 🔴 alert so it can be graded later."""
     signal = play_signal(play, profile, cfg, wallet)
-    if signal not in ("green", "big", "fade", "watch"):
+    if signal not in ("green", "big", "hot", "fade", "watch"):
         return
     unit = (profile or {}).get("unit")
     alerts = state.setdefault("_alerts", [])
@@ -1172,14 +1271,16 @@ def build_scorecard(state, wallets, cfg):
              tally_line("🔵 Whale Model", [a for a in recent if a["signal"] == "official"]),
              tally_line("🟢 Green lights", [a for a in recent if a["signal"] == "green"]),
              tally_line("🟡 Big plays", [a for a in recent if a["signal"] == "big"]),
+             tally_line("🔥 Hot streaks", [a for a in recent if a["signal"] == "hot"]),
              "",
              "**Since tracking began**",
              tally_line("🔵 Whale Model", [a for a in alerts if a["signal"] == "official"]),
              tally_line("🟢 Green lights", [a for a in alerts if a["signal"] == "green"]),
              tally_line("🟡 Big plays", [a for a in alerts if a["signal"] == "big"]),
+             tally_line("🔥 Hot streaks", [a for a in alerts if a["signal"] == "hot"]),
              ]
     if any(a["signal"] == "watch" for a in alerts):      # only if track= is used
-        lines.insert(4, tally_line("👀 Tracking", [a for a in recent if a["signal"] == "watch"]))
+        lines.insert(5, tally_line("👀 Tracking", [a for a in recent if a["signal"] == "watch"]))
         lines.append(tally_line("👀 Tracking", [a for a in alerts if a["signal"] == "watch"]))
 
     # Wallet table: how each wallet's alerts have done (all-time).
@@ -1188,7 +1289,7 @@ def build_scorecard(state, wallets, cfg):
         key = state_key(w["address"])
         name = (w["label"] or short(w["address"]))[:15]
         mine = [a for a in alerts if a["wallet"] == key
-                and a["signal"] in ("green", "big", "watch")]
+                and a["signal"] in ("green", "big", "hot", "watch")]
         wins, losses, roi, units = tally(mine)
         rows.append((units if wins + losses else -999, name, wins, losses, roi, units))
     rows.sort(key=lambda r: r[0], reverse=True)
@@ -1198,7 +1299,7 @@ def build_scorecard(state, wallets, cfg):
             table.append(f"{name:<15} {f'{wins}-{losses}':<7} {roi:>+4.0f}%  {units:>+6.2f}u")
         else:
             table.append(f"{name:<15} -")
-    lines += ["", "**Wallets** (their 🟢/🟡 alerts)", "```", *table, "```"]
+    lines += ["", "**Wallets** (their 🟢/🟡/🔥 alerts)", "```", *table, "```"]
 
     # Focus list: each wallet's strongest play type, best first.
     focus = []
@@ -1377,7 +1478,16 @@ def send_preview(webhook_url, cfg):
     preview_cfg = dict(cfg, min_sample=15)
     embed = build_alert(play, wallet, profile, preview_cfg)
     embed["footer"] = {"text": "PREVIEW - not a real play"}
-    post_to_discord(webhook_url, embeds=[embed])
+    hot_profile = {"unit": 280, "buckets": {lab: {"w": 0, "l": 0, "stake": 0.0, "pnl": 0.0}
+                                            for _, _, lab in BUCKETS},
+                   "sports": {}, "streak": {"updated": now, "sports": {
+                       "NBA": [115, 105, 61600.0, 7400.0]}}}
+    hot = build_alert(dict(play, usd=420.0, outcome="Nuggets", price=0.39,
+                           title="Celtics vs. Nuggets", eventSlug="nba-bos-den"),
+                      {"address": wallet["address"], "label": "EdgeHunter"},
+                      hot_profile, preview_cfg)
+    hot["footer"] = {"text": "PREVIEW - not a real play"}
+    post_to_discord(webhook_url, embeds=[embed, hot])
 
     # A sample weekly scorecard with made-up wallets and results.
     names = {"TrustMeBro": [("green", "W", .52), ("green", "W", .48), ("green", "L", .55),
@@ -1405,6 +1515,10 @@ def send_preview(webhook_url, cfg):
             alerts.append({"wallet": key, "signal": signal, "ts": now - 86400,
                            "result": result, "price": price,
                            "pnl": round((1 - price) / price, 3) if result == "W" else -1.0})
+    for result, price in [("W", .40), ("L", .48), ("W", .45)]:
+        alerts.append({"wallet": state_key(fake_wallets[1]["address"]), "signal": "hot",
+                       "ts": now - 86400, "result": result, "price": price,
+                       "pnl": round((1 - price) / price, 3) if result == "W" else -1.0})
     for result, price in [("W", .45), ("W", .52), ("L", .50), ("W", .38)]:
         alerts.append({"wallet": state_key(fake_wallets[0]["address"]), "signal": "official",
                        "ts": now - 86400, "result": result, "price": price,
@@ -1446,6 +1560,13 @@ def main():
         "max_price": setting("MAX_BUY_PRICE", MAX_BUY_PRICE, float),
         "sport_grading": setting("SPORT_GRADING", SPORT_GRADING, int),
         "hedge_hours": setting("HEDGE_HOURS", HEDGE_HOURS, float),
+        "hot_streak": setting("HOT_STREAK", HOT_STREAK, int),
+        "streak_days": setting("STREAK_DAYS", STREAK_DAYS, float),
+        "streak_min_plays": setting("STREAK_MIN_PLAYS", STREAK_MIN_PLAYS, int),
+        "streak_min_roi": setting("STREAK_MIN_ROI", STREAK_MIN_ROI, float),
+        "streak_z": setting("STREAK_Z", STREAK_Z, float),
+        "streak_lt_floor": setting("STREAK_LONGTERM_FLOOR", STREAK_LONGTERM_FLOOR, float),
+        "streak_refresh_hours": setting("STREAK_REFRESH_HOURS", STREAK_REFRESH_HOURS, float),
         "official": setting("OFFICIAL_PICKS", OFFICIAL_PICKS, int),
         "official_safe_roi": setting("OFFICIAL_MIN_SAFE_ROI", OFFICIAL_MIN_SAFE_ROI, float),
         "official_units": setting("OFFICIAL_MIN_UNITS", OFFICIAL_MIN_UNITS, float),
